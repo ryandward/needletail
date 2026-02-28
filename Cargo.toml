@@ -1,0 +1,19 @@
+[package]
+name = "seqchain-native"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "seqchain_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3     = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+bio      = "1"
+anyhow   = "1"
+memmap2  = "0.9"
+tempfile = "=3.10.1"
+rayon    = "1"
+
+[profile.release]
+lto = true
