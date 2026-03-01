@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
-use crate::simd_search::FmOcc;
+use super::simd_search::FmOcc;
 
 /// Small seed length. 4^10 = 1,048,576 entries × 8 bytes = 8 MiB.
 /// Used for mm ≤ 2: non-overlapping segments, seed_mm=1, 43 variants max.

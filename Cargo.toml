@@ -16,6 +16,7 @@ tempfile = "=3.10.1"
 rayon    = "1"
 rkyv     = { version = "0.8", features = ["bytecheck"] }
 libc     = "0.2"
+sha2     = "0.10"
 arrow    = { version = "54", default-features = false, features = ["ffi"] }
 parquet  = { version = "54", default-features = false, features = ["arrow", "snap"] }
 

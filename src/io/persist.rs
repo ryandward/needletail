@@ -20,9 +20,9 @@ use std::path::Path;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::{Archive, Deserialize, Serialize};
 
+use crate::engine::fm_index::FmIndexSearcher;
+use crate::engine::simd_search::{ChromGeometry, FmOcc, BASES};
 use crate::error::SearchError;
-use crate::fm_index::FmIndexSearcher;
-use crate::simd_search::{ChromGeometry, FmOcc, BASES};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Huge Page mmap — strict MAP_HUGETLB, no fallback

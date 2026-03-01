@@ -23,8 +23,8 @@ use std::slice;
 use memmap2::Mmap;
 use tempfile::tempfile;
 
-use crate::fm_index::{RankBlock, BLOCK_SIZE};
-use crate::kmer_index::{KmerSeedTable, PosTable};
+use super::fm_index::{RankBlock, BLOCK_SIZE};
+use super::kmer_index::{KmerSeedTable, PosTable};
 
 // Precomputed score table: score[mm] = 1.0 / (1.0 + mm)
 const SCORE_LUT: [f32; 4] = [1.0, 0.5, 1.0 / 3.0, 0.25];

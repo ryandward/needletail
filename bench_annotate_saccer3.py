@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Idiomatic SeqChain pipeline — native SIMD scorer replacing bowtie1.
+"""Fully native SeqChain pipeline — Rust PAM scan + Rust PAM-validated scorer.
 
-Composes the standard SeqChain generator chain:
+Composes the SeqChain generator chain with Rust-native guide scanning:
 
-    regex_map → interpret_guides → score_off_targets_native → anchor_features
+    scan_guides (Rust) → score_off_targets_fast → anchor_features
     → annotate_tracks → filter promoters → append_tss_distance
     → stream_json_export
 
-The only change from the canonical annotate_saccer3_cas9.py is swapping
-``score_off_targets`` (bowtie subprocess) for ``score_off_targets_native``
-(SIMD FM-Index, chunked streaming, O(chunk_size) memory).
+All heavy-lifting in Rust: PAM scanning, spacer extraction, off-target search
+(width-capped BWT), and PAM validation (IUPAC bitmask engine on mmap'd text).
+Python is a thin membrane for Region construction and pipeline wiring.
 
 Usage:
     python bench_annotate_saccer3.py -o sacCer3_native_idiomatic.json
-    python bench_annotate_saccer3.py --mm 2 -o output.json
+    python bench_annotate_saccer3.py --mm 2 --max-width 16 -o output.json
 """
 
 from __future__ import annotations
@@ -31,18 +31,15 @@ from seqchain.region import Region
 from seqchain.io.genome import load_genbank
 from seqchain.io.tracks import stream_json_export
 
-# ─── Zone 3: Operations (native scorer) ──────────────────────────────
-from seqchain.operations.score.native_off_target import score_off_targets_native
-
 # ─── Zone 4: Recipes ─────────────────────────────────────────────────
 from seqchain.recipes import load_feature_config, load_preset
-from seqchain.recipes.crispr import interpret_guides
 from seqchain.recipes.anchor import anchor_features
 from seqchain.recipes.annotate import annotate_tracks, append_tss_distance
-from seqchain.transform.regex import regex_map
 
 # ─── Native engine ───────────────────────────────────────────────────
+sys.path.insert(0, str(Path(__file__).parent))
 from needletail import FmIndex
+from python.needletail_guides import scan_guides, score_off_targets_fast
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -64,8 +61,8 @@ def main():
                         help="Output JSON path (via stream_json_export)")
     parser.add_argument("--mm", type=int, default=2,
                         help="Mismatches for off-target search (default: 2)")
-    parser.add_argument("--chunk-size", type=int, default=65536,
-                        help="Guides per search batch (default: 65536)")
+    parser.add_argument("--max-width", type=int, default=8,
+                        help="BWT width cap per guide (default: 8)")
     args = parser.parse_args()
 
     t_total = time.perf_counter()
@@ -116,37 +113,26 @@ def main():
     #  PIPELINE ASSEMBLY — nothing computed yet
     # ═════════════════════════════════════════════════════════════════
     #
-    #  genome.sequences
+    #  scan_guides             → guide Regions (Rust: PAM scan + enrich)
     #    │
-    #    ▼  regex_map           → PAM hit Regions          (generator)
-    #    ▼  interpret_guides    → guide Regions w/ spacers  (generator)
-    #    ▼  score_off_targets_native → scored Regions       (chunked generator)
+    #    ▼  score_off_targets_fast → scored Regions  (single Rust search_batch)
     #    ▼  annotate_tracks     → feature_type stamped      (sweep-line)
     #    ▼  filter promoters    → promoter guides only      (generator)
     #    ▼  append_tss_distance → signed_distance tag       (generator)
     #    ▼  stream_json_export  → DRAIN to disk
     #
 
-    # Stage 1: Scan PAM sites
-    hits = regex_map(
-        genome.sequences, preset.pam,
-        topologies=genome.topologies,
-    )
+    # Stage 1+2: Scan PAM sites + extract spacers (Rust, GIL released)
+    guides = scan_guides(idx, preset, genome)
 
-    # Stage 2: Extract spacers
-    guides = interpret_guides(
-        hits, genome.sequences, preset,
-        topologies=genome.topologies,
-    )
-
-    # Stage 3: SIMD off-target scoring (replaces bowtie)
-    scored = score_off_targets_native(
-        guides, idx, genome.sequences, preset.pam,
+    # Stage 3: SIMD off-target scoring — single search_batch, PAM in Rust
+    scored = score_off_targets_fast(
+        guides, idx, preset.pam,
         spacer_len=preset.spacer_len,
         pam_direction=preset.pam_direction,
         mismatches=args.mm,
         topologies=genome.topologies,
-        chunk_size=args.chunk_size,
+        max_width=args.max_width,
     )
 
     # Stage 4: Tile features
@@ -203,7 +189,7 @@ def main():
 
     print(f"\n{'─' * 60}")
     print(f"  SacCer3 SpCas9 CRISPRi promoter library — NATIVE SIMD")
-    print(f"  mm={args.mm}  chunk_size={args.chunk_size}")
+    print(f"  mm={args.mm}  max_width={args.max_width}")
     print(f"{'─' * 60}")
     print(f"  Promoter-targeting guides     : {n:>12,}")
     print(f"  Unique genes targeted         : {unique_genes:>12,}")

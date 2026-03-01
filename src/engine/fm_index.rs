@@ -25,7 +25,7 @@ use bio::data_structures::suffix_array::{suffix_array, RawSuffixArray};
 use bio::io::fasta;
 
 use crate::error::SearchError;
-use crate::simd_search::{ChromGeometry, FmOcc, BASES};
+use super::simd_search::{ChromGeometry, FmOcc, BASES};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Cache-Line Aligned Rank Blocks

@@ -1,17 +1,28 @@
-//! needletail — PyO3 Python extension for width-first SIMD FM-Index search.
+//! Orchestration & FFI — the only layer that knows Python exists.
 //!
-//! Exposes `FmIndex` to Python. Construction is synchronous (builds the index
-//! from a FASTA file). `search_batch` releases the GIL, runs the width-first
-//! engine, and returns flat arrays directly to Python.
+//! Holds the PyO3 `#[pyclass]` definitions (`FmIndex`, `GuideBuffer`),
+//! manages the GIL (`py.allow_threads`), and orchestrates calls into the
+//! five foundation pillars:
+//!
+//! ```text
+//!   geometry    ← pure 1D coordinate math (leaf, no deps)
+//!   chemistry   ← molecular rules: PAM masks, guide IDs (leaf, no deps)
+//!   engine/     ← BWT, SIMD search, k-mer seeds (depends on geometry)
+//!   io/         ← mmap persistence, Parquet sink (depends on engine)
+//!   operations/ ← PAM scanning, off-target validation (depends on all above)
+//! ```
+//!
+//! This file is the only place where `pyo3` is imported.
 
 #![deny(clippy::all)]
 
+// ─── The five pillars ────────────────────────────────────────────────────────
+mod chemistry;
+mod engine;
 mod error;
-mod fm_index;
-mod kmer_index;
-mod parquet_sink;
-mod persist;
-mod simd_search;
+mod geometry;
+mod io;
+mod operations;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -19,11 +30,15 @@ use std::sync::Arc;
 use bio::alphabets::dna;
 use pyo3::prelude::*;
 
-use crate::fm_index::FmIndexSearcher;
-use crate::kmer_index::{KmerSeedTable, PosTable, SEED_K_LARGE, SEED_K_SMALL};
-use crate::persist::MappedIndex;
-use crate::simd_search::{
+use crate::chemistry::{CompiledPam, PamDirection};
+use crate::engine::fm_index::FmIndexSearcher;
+use crate::engine::kmer_index::{KmerSeedTable, PosTable, SEED_K_LARGE, SEED_K_SMALL};
+use crate::engine::simd_search::{
     search_width_first, search_width_first_seeded, ChromGeometry, FmOcc, HitAccumulator,
+};
+use crate::io::persist::MappedIndex;
+use crate::operations::pam_scanner::{
+    enrich_hits, filter_hits_by_pam, find_pam_sites, GuideHits,
 };
 
 // ─── IndexInner ──────────────────────────────────────────────────────────────
@@ -313,7 +328,7 @@ impl FmIndex {
         let searcher = FmIndexSearcher::from_fasta(fasta_path)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        persist::save_index(&searcher, Path::new(index_path))
+        io::persist::save_index(&searcher, Path::new(index_path))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         let searcher = Arc::new(searcher);
@@ -336,7 +351,7 @@ impl FmIndex {
     /// Call `warm_seeds()` after load to enable seeded search if needed.
     #[staticmethod]
     fn load(index_path: &str) -> PyResult<Self> {
-        let mapped = persist::load_index(Path::new(index_path))
+        let mapped = io::persist::load_index(Path::new(index_path))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         let mapped = Arc::new(mapped);
 
@@ -373,7 +388,7 @@ impl FmIndex {
                     if kmer_path.exists() {
                         KmerSeedTable::open(&kmer_path, k).ok()
                     } else {
-                        kmer_index::build_kmer_index(&**m, k, &kmer_path)
+                        engine::kmer_index::build_kmer_index(&**m, k, &kmer_path)
                             .ok()
                             .and_then(|()| KmerSeedTable::open(&kmer_path, k).ok())
                     }
@@ -406,14 +421,21 @@ impl FmIndex {
     ///   mm ≤ 2 → K=10 seed tier (non-overlapping, fast seeding)
     ///   mm = 3 → K=14 seed tier (deeper seed, fewer BWT steps)
     ///
+    /// When `pam` is provided, hits are filtered in Rust using the IUPAC bitmask
+    /// engine: only positions with a valid adjacent PAM survive. This replaces
+    /// Python-side PAM regex validation entirely.
+    ///
     /// Returns `(query_indices, positions, strands, scores)` — four parallel lists.
-    #[pyo3(signature = (queries, mismatches=0, max_width=u32::MAX))]
+    #[pyo3(signature = (queries, mismatches=0, max_width=u32::MAX, pam=None, pam_direction="downstream", topologies=None))]
     fn search_batch(
         &self,
         py: Python<'_>,
         queries: Vec<String>,
         mismatches: u8,
         max_width: u32,
+        pam: Option<&str>,
+        pam_direction: &str,
+        topologies: Option<Vec<bool>>,
     ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<bool>, Vec<f32>)> {
         if queries.is_empty() {
             return Ok((vec![], vec![], vec![], vec![]));
@@ -424,21 +446,38 @@ impl FmIndex {
 
         let chroms = self.inner.chrom_geometry();
 
-        // ── Dynamic tier routing ─────────────────────────────────────
-        if let Some((tier, _k)) = self.select_tier(mismatches, query_len) {
+        // Compile PAM filter if provided.
+        let compiled_pam = match pam {
+            Some(p) => Some(
+                CompiledPam::compile(p)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e))?,
+            ),
+            None => None,
+        };
+        let direction = match pam_direction {
+            "downstream" => PamDirection::Downstream,
+            "upstream" => PamDirection::Upstream,
+            _ => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "pam_direction must be 'downstream' or 'upstream'",
+                ));
+            }
+        };
+
+        // ── Search (GIL released) ────────────────────────────────────
+        let mut acc = if let Some((tier, _k)) = self.select_tier(mismatches, query_len) {
             let seed_table = tier.seed_table.clone();
             let pos_table = tier.pos_table.clone();
 
             match &self.inner {
                 IndexInner::Built(index) => {
                     let index = index.clone();
-                    let hits = py.allow_threads(move || {
-                        let genome_text = index.text();
+                    py.allow_threads(move || {
                         run_search_seeded(
                             &*index,
                             &seed_table,
                             &pos_table,
-                            genome_text,
+                            index.text(),
                             &queries_fwd,
                             &queries_rc,
                             query_len,
@@ -446,23 +485,19 @@ impl FmIndex {
                             max_width,
                             &chroms,
                         )
-                    });
-                    match hits {
-                        Ok(acc) => Ok((acc.query_id, acc.position, acc.strand, acc.score)),
-                        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                            e.to_string(),
-                        )),
-                    }
+                    })
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                    })?
                 }
                 IndexInner::Loaded(index) => {
                     let index = index.clone();
-                    let hits = py.allow_threads(move || {
-                        let genome_text = index.text();
+                    py.allow_threads(move || {
                         run_search_seeded(
                             &*index,
                             &seed_table,
                             &pos_table,
-                            genome_text,
+                            index.text(),
                             &queries_fwd,
                             &queries_rc,
                             query_len,
@@ -470,13 +505,10 @@ impl FmIndex {
                             max_width,
                             &chroms,
                         )
-                    });
-                    match hits {
-                        Ok(acc) => Ok((acc.query_id, acc.position, acc.strand, acc.score)),
-                        Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                            e.to_string(),
-                        )),
-                    }
+                    })
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                    })?
                 }
             }
         } else {
@@ -484,7 +516,7 @@ impl FmIndex {
             match &self.inner {
                 IndexInner::Built(index) => {
                     let index = index.clone();
-                    let hits = py.allow_threads(move || {
+                    py.allow_threads(move || {
                         run_search_unseeded(
                             &*index,
                             &queries_fwd,
@@ -494,12 +526,11 @@ impl FmIndex {
                             max_width,
                             &chroms,
                         )
-                    });
-                    Ok((hits.query_id, hits.position, hits.strand, hits.score))
+                    })
                 }
                 IndexInner::Loaded(index) => {
                     let index = index.clone();
-                    let hits = py.allow_threads(move || {
+                    py.allow_threads(move || {
                         run_search_unseeded(
                             &*index,
                             &queries_fwd,
@@ -509,11 +540,27 @@ impl FmIndex {
                             max_width,
                             &chroms,
                         )
-                    });
-                    Ok((hits.query_id, hits.position, hits.strand, hits.score))
+                    })
                 }
             }
+        };
+
+        // ── PAM filter (pure Rust, runs after search) ────────────────
+        if let Some(ref compiled) = compiled_pam {
+            let text = self.inner.text();
+            let filter_chroms = self.inner.chrom_geometry();
+            filter_hits_by_pam(
+                &mut acc,
+                text,
+                &filter_chroms,
+                compiled,
+                direction,
+                query_len,
+                topologies.as_deref(),
+            );
         }
+
+        Ok((acc.query_id, acc.position, acc.strand, acc.score))
     }
 
     /// Exhaustive search (no seeding, no clog pruning) — for ground truth validation.
@@ -647,7 +694,7 @@ impl FmIndex {
 
         // Sink directly to Parquet via Arrow builders — zero string allocation.
         let chroms_geo = self.inner.chrom_geometry();
-        let n_rows = parquet_sink::hits_to_parquet(&acc, &chroms_geo, &out_path)
+        let n_rows = io::parquet_sink::hits_to_parquet(&acc, &chroms_geo, &out_path)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         Ok(n_rows)
@@ -662,6 +709,202 @@ impl FmIndex {
     fn chrom_ranges(&self) -> Vec<(usize, usize)> {
         self.inner.chrom_geometry().ranges
     }
+
+    /// Scan the genome for CRISPR guide sites defined by a PAM motif.
+    ///
+    /// Returns `(chrom_ids, positions, strands, spacers, pam_seqs)` — five
+    /// flat arrays. `spacers` and `pam_seqs` are packed byte buffers with
+    /// stride `spacer_len` and `len(pam)` respectively.
+    ///
+    /// ```python
+    /// c, p, s, spacers, pams = idx.find_guides("NGG", 20, "downstream")
+    /// # spacers[i*20:(i+1)*20] is the i-th spacer sequence
+    /// ```
+    #[pyo3(signature = (pam, spacer_len, pam_direction="downstream", topologies=None))]
+    fn find_guides(
+        &self,
+        py: Python<'_>,
+        pam: &str,
+        spacer_len: usize,
+        pam_direction: &str,
+        topologies: Option<Vec<bool>>,
+    ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<i8>, Vec<u8>, Vec<u8>)> {
+        let direction = match pam_direction {
+            "downstream" => PamDirection::Downstream,
+            "upstream" => PamDirection::Upstream,
+            _ => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "pam_direction must be 'downstream' or 'upstream'",
+                ));
+            }
+        };
+
+        if spacer_len == 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "spacer_len must be > 0",
+            ));
+        }
+
+        let pam_owned = pam.to_string();
+        let chroms = self.inner.chrom_geometry();
+
+        let result = match &self.inner {
+            IndexInner::Built(index) => {
+                let index = index.clone();
+                py.allow_threads(move || {
+                    let topo_ref = topologies.as_deref();
+                    find_pam_sites(index.text(), &chroms, &pam_owned, spacer_len, direction, topo_ref)
+                })
+            }
+            IndexInner::Loaded(index) => {
+                let index = index.clone();
+                py.allow_threads(move || {
+                    let topo_ref = topologies.as_deref();
+                    find_pam_sites(index.text(), &chroms, &pam_owned, spacer_len, direction, topo_ref)
+                })
+            }
+        };
+
+        match result {
+            Ok(hits) => Ok((hits.chrom_id, hits.position, hits.strand, hits.spacers, hits.pam_seqs)),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(e)),
+        }
+    }
+
+    /// Scan for CRISPR guide sites and return an enriched GuideBuffer.
+    ///
+    /// Performs PAM scanning and guide enrichment (footprints, guide_seqs,
+    /// guide_ids) entirely in Rust with the GIL released. Returns a
+    /// `GuideBuffer` that supports `len()` and `buf[i]` access from Python.
+    #[pyo3(signature = (pam, spacer_len, pam_direction="downstream", topologies=None))]
+    fn scan_guides(
+        &self,
+        py: Python<'_>,
+        pam: &str,
+        spacer_len: usize,
+        pam_direction: &str,
+        topologies: Option<Vec<bool>>,
+    ) -> PyResult<GuideBuffer> {
+        let direction = match pam_direction {
+            "downstream" => PamDirection::Downstream,
+            "upstream" => PamDirection::Upstream,
+            _ => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "pam_direction must be 'downstream' or 'upstream'",
+                ));
+            }
+        };
+
+        if spacer_len == 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "spacer_len must be > 0",
+            ));
+        }
+
+        let pam_owned = pam.to_string();
+        let chroms = self.inner.chrom_geometry();
+        let chrom_names = self.inner.chrom_names();
+        let chrom_ranges = chroms.ranges.clone();
+
+        let result: Result<GuideHits, String> = match &self.inner {
+            IndexInner::Built(index) => {
+                let index = index.clone();
+                let names = chrom_names.clone();
+                py.allow_threads(move || {
+                    let topo_ref = topologies.as_deref();
+                    let hits = find_pam_sites(
+                        index.text(), &chroms, &pam_owned, spacer_len, direction, topo_ref,
+                    )?;
+                    Ok(enrich_hits(hits, &names, direction, topo_ref, &chrom_ranges))
+                })
+            }
+            IndexInner::Loaded(index) => {
+                let index = index.clone();
+                let names = chrom_names.clone();
+                py.allow_threads(move || {
+                    let topo_ref = topologies.as_deref();
+                    let hits = find_pam_sites(
+                        index.text(), &chroms, &pam_owned, spacer_len, direction, topo_ref,
+                    )?;
+                    Ok(enrich_hits(hits, &names, direction, topo_ref, &chrom_ranges))
+                })
+            }
+        };
+
+        match result {
+            Ok(guide_hits) => Ok(GuideBuffer { hits: guide_hits, chrom_names }),
+            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(e)),
+        }
+    }
+}
+
+// ─── GuideBuffer ─────────────────────────────────────────────────────────────
+
+#[pyclass]
+struct GuideBuffer {
+    hits: GuideHits,
+    chrom_names: Vec<String>,
+}
+
+#[pymethods]
+impl GuideBuffer {
+    #[getter]
+    fn count(&self) -> usize {
+        self.hits.count
+    }
+
+    #[getter]
+    fn spacer_len(&self) -> usize {
+        self.hits.spacer_len
+    }
+
+    #[getter]
+    fn pam_len(&self) -> usize {
+        self.hits.pam_len
+    }
+
+    #[getter]
+    fn chrom_names(&self) -> Vec<String> {
+        self.chrom_names.clone()
+    }
+
+    fn __len__(&self) -> usize {
+        self.hits.count
+    }
+
+    fn __getitem__(&self, py: Python<'_>, idx: isize) -> PyResult<PyObject> {
+        let n = self.hits.count as isize;
+        let i = if idx < 0 { idx + n } else { idx };
+        if i < 0 || i >= n {
+            return Err(PyErr::new::<pyo3::exceptions::PyIndexError, _>(
+                "index out of range",
+            ));
+        }
+        let i = i as usize;
+        let sl = self.hits.spacer_len;
+        let pl = self.hits.pam_len;
+        let gl = sl + pl;
+
+        let cid = self.hits.chrom_ids[i];
+        let pam_pos = self.hits.pam_positions[i];
+        let gs = self.hits.guide_starts[i];
+        let ge = self.hits.guide_ends[i];
+        let strand_str = if self.hits.strands[i] > 0 { "+" } else { "-" };
+        let spacer = &self.hits.spacers[i * sl..(i + 1) * sl];
+        let pam_seq = &self.hits.pam_seqs[i * pl..(i + 1) * pl];
+        let guide_seq = &self.hits.guide_seqs[i * gl..(i + 1) * gl];
+        let guide_id = std::str::from_utf8(&self.hits.guide_ids[i * 8..(i + 1) * 8])
+            .unwrap_or("");
+
+        Ok((
+            cid, pam_pos, gs, ge,
+            strand_str, spacer, pam_seq, guide_seq, guide_id,
+        )
+            .into_pyobject(py)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+            .into_any()
+            .unbind())
+    }
 }
 
 // ─── Module ──────────────────────────────────────────────────────────────────
@@ -669,5 +912,6 @@ impl FmIndex {
 #[pymodule]
 fn needletail(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FmIndex>()?;
+    m.add_class::<GuideBuffer>()?;
     Ok(())
 }

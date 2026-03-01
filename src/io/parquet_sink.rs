@@ -21,8 +21,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
-use crate::simd_search::ChromGeometry;
-use crate::simd_search::HitAccumulator;
+use crate::engine::simd_search::{ChromGeometry, HitAccumulator};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Schema

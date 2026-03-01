@@ -5,7 +5,7 @@
 Needletail is a Rust + PyO3 short-read aligner purpose-built for the
 off-target scoring bottleneck in CRISPR guide design pipelines.  It replaces
 Bowtie 1's subprocess-and-disk workflow with an in-process, memory-mapped
-FM-Index searched by an AVX2 vertical automaton — delivering 3–24x faster
+FM-Index searched by an AVX2 vertical automaton — delivering 3–28x faster
 mismatch search while producing bit-identical results.
 
 Needletail ships as a native Python extension (`needletail`) and
@@ -19,8 +19,10 @@ from needletail import FmIndex
 idx = FmIndex.load("sacCer3.seqchain")      # 51 µs  (mmap, zero-copy)
 idx.warm_seeds("sacCer3.seqchain")           # 5.6 s  (K=10 + K=14 tables)
 
+# Search with in-Rust PAM validation — no Python-side regex needed
 qi, pos, strand, scores = idx.search_batch(
-    spacers, mismatches=2,                   # 33 µs/query, 893K queries
+    spacers, mismatches=2, max_width=8,
+    pam="NGG", pam_direction="downstream",   # IUPAC bitmask filter
 )
 ```
 
@@ -37,6 +39,7 @@ three compromises that hurt CRISPR pipelines:
 | **Process model** | Subprocess per invocation | In-process FFI, GIL released |
 | **Index loading** | Read + deserialize `.ebwt` (10 s) | `mmap()` + pointer cast (51 µs) |
 | **Mismatch search** | Backtracking DFS, scalar | AVX2 vertical automaton, 256-wide |
+| **PAM validation** | Shell-side regex (Python) | In-Rust IUPAC bitmask engine |
 | **Output format** | Write SAM/bowtie to disk, re-parse | Return NumPy-compatible arrays |
 | **Pipeline integration** | Shell pipes, temp files | Python generator (`ScorerFn`) |
 
@@ -51,24 +54,33 @@ temp files, and no SAM parsing.
 All benchmarks on the *Saccharomyces cerevisiae* S288C reference genome
 (SacCer3, 12.16 Mbp, 17 chromosomes).  Machine: AMD Zen 4, 16 cores.
 
-### Genome-wide SpCas9 guide design: 893,267 unique spacers
+### Off-target scoring: 893,268 unique spacers
 
-NGG PAM, 20 bp spacer, report all hits (`-a`), PAM-validated.
+NGG PAM, 20 bp spacer, mm=2, `max_width=8`, PAM-validated in Rust.
 
-| Mismatch | Raw hits | PAM-valid | Needletail | Bowtie 1 | Speedup |
-|----------|----------|-----------|------------|----------|---------|
-| mm=2 | 1,790,098 | 1,076,797 | **29.8 s** | 100.8 s | **3.4x** |
+| Stage | Needletail | Bowtie 1 pipeline |
+|-------|------------|-------------------|
+| search_batch (BWT + PAM filter) | **3.95 s** | 111 s |
+| Scoring speedup | | **28x** |
 
-Hit counts match exactly.  852,930 unique guides (score = 0) in both.
+967,398 PAM-valid hits.  70,425 promoter-targeting guides, 5,443 genes,
+93.8% perfectly specific (score = 0.0).
 
-**End-to-end pipeline** (load + warm + search + PAM validate):
+### End-to-end CRISPRi pipeline
 
-| | Needletail (hot) | Bowtie 1 |
-|---|---|---|
-| Index load | 51 µs (mmap) | 10.3 s (build) |
-| Search mm=2 | 29.8 s | 100.8 s |
-| PAM validate | 1.9 s | 3.1 s |
-| **Total** | **31.7 s** | **114.1 s** |
+Full pipeline: scan + score + annotate + filter + TSS distance + JSON export.
+
+```
+70,425 promoter-targeting guides
+ 5,443 unique genes targeted
+66,046 perfectly specific (93.8%)
+
+Genome load  : 1.63s
+mmap load    : 169602 µs
+warm_seeds   : 6.29s
+Pipeline drain: 20.93s
+Wall-clock    : 29.05s
+```
 
 ### Chromosome 1 (230 kb): scaling across mismatch levels
 
@@ -85,43 +97,40 @@ The advantage grows with mismatch budget because the vertical automaton
 processes all 4 mismatch tiers in a single pass, while Bowtie's backtracking
 DFS explores an exponentially larger tree.
 
-### Idiomatic SeqChain pipeline
-
-Full CRISPRi promoter library: scan + interpret + score + annotate + filter +
-distance + stream to JSON.  Pure generator chain, O(chunk) memory.
-
-```
-70,425 promoter-targeting guides
- 5,443 unique genes targeted
-65,001 perfectly specific (92.3%)
-
-Genome load  : 1.48 s
-mmap load    : 51 µs
-warm_seeds   : 5.62 s
-Pipeline drain: 69.0 s
-Wall-clock    : 76.1 s
-```
-
 ---
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        Python (PyO3)                        │
-│  FmIndex.build()  ·  FmIndex.load()  ·  search_batch()     │
-├──────────────┬──────────────┬───────────────────────────────┤
-│  fm_index.rs │  persist.rs  │        simd_search.rs         │
-│  BWT + SA    │  rkyv + mmap │  AVX2 vertical automaton      │
-│  BlockRank   │  zero-copy   │  SSE2 LF-mapping              │
-├──────────────┼──────────────┤  width-first BFS              │
-│ kmer_index.rs│  strand.rs   │  seeded + unseeded dispatch   │
-│ K=10, K=14   │  +/- decode  │  rayon parallel groups        │
-│ seed tables  │              │                               │
-└──────────────┴──────────────┴───────────────────────────────┘
-```
+Needletail follows the **SeqChain 5-pillar import hierarchy**: strict
+layering from pure math to FFI, where each layer depends only on layers
+below it.
 
-**4,181 lines of Rust.  7 dependencies.  One purpose.**
+```
+src/
+├── geometry.rs         Pure 1D coordinate math (leaf, no deps)
+│                       normalize · interval_envelope · is_low_side
+│                       complement_base · fetch_sequence
+│
+├── chemistry.rs        Molecular rules (leaf, no deps)
+│                       PamDirection · CompiledPam · BASE_MASK
+│                       generate_guide_id
+│
+├── engine/             BWT search structures
+│   ├── fm_index.rs     BlockRank, rank/occ queries
+│   ├── kmer_index.rs   K=10 / K=14 seed tables, PosTable
+│   └── simd_search.rs  AVX2 vertical automaton, width-first BFS
+│
+├── io/                 Disk boundary
+│   ├── persist.rs      rkyv zero-copy serialization, mmap
+│   └── parquet_sink.rs Arrow zero-copy Parquet export
+│
+├── operations/         Hot loops (composition layer)
+│   └── pam_scanner.rs  PAM site scanning, guide enrichment,
+│                       PAM validation, off-target filtering
+│
+└── lib.rs              Orchestration & FFI (only file that imports pyo3)
+    FmIndex · GuideBuffer · search_batch · scan_guides
+```
 
 ### The FM-Index: BlockRank
 
@@ -175,6 +184,15 @@ For groups smaller than 256, an SSE2 fallback uses 128-bit registers with
 the same logic.  Runtime detection (`is_x86_feature_detected!("avx2")`)
 selects the path.
 
+### IUPAC Bitmask PAM Validation
+
+PAM validation runs in Rust after the BWT search completes. Each IUPAC
+character in the PAM pattern is compiled to a 4-bit mask (A=0001, C=0010,
+G=0100, T=1000, N=1111, etc.). At each hit position, the engine checks
+`BASE_MASK[genome[pos]] & pam_mask[j] != 0` — O(1) per position with no
+regex overhead. Both forward and reverse-complement PAMs are checked via
+precomputed mask arrays.
+
 ### Seed Tables: Two-Tier Acceleration
 
 K-mer seed tables pre-index the genome at K=10 (8 MiB, for mm ≤ 2) and K=14
@@ -192,60 +210,78 @@ class FmIndex:
     def load(index_path: str) -> FmIndex: ...
     def warm_seeds(index_path: str) -> None: ...
     def search_batch(
-        queries: list[str], mismatches: int = 0,
+        queries: list[str],
+        mismatches: int = 0,
+        max_width: int = 2**32,
+        pam: str | None = None,
+        pam_direction: str = "downstream",
+        topologies: list[bool] | None = None,
     ) -> tuple[list[int], list[int], list[bool], list[float]]: ...
     def search_batch_exhaustive(
         queries: list[str], mismatches: int = 0,
     ) -> tuple[list[int], list[int], list[bool], list[float]]: ...
+    def scan_guides(
+        pam: str, spacer_len: int,
+        pam_direction: str = "downstream",
+        topologies: list[bool] | None = None,
+    ) -> GuideBuffer: ...
     def chrom_names() -> list[str]: ...
     def chrom_ranges() -> list[tuple[int, int]]: ...
+
+class GuideBuffer:
+    count: int
+    spacer_len: int
+    pam_len: int
+    def __len__() -> int: ...
+    def __getitem__(i: int) -> tuple: ...
 ```
 
-The GIL is released during `search_batch`, `build`, and `warm_seeds`.
-Rayon parallelizes across query groups internally.
+The GIL is released during `search_batch`, `scan_guides`, `build`, and
+`warm_seeds`. Rayon parallelizes across query groups internally.
 
 ---
 
 ## SeqChain Integration
 
-Needletail plugs into the SeqChain generator architecture as a `ScorerFn`
-operation:
+Needletail plugs into the SeqChain generator architecture with two
+high-level bridges in `python/needletail_guides.py`:
+
+### `scan_guides()` — Rust-native PAM scanning
+
+Replaces `regex_map() + interpret_guides()`. All coordinate math, sequence
+assembly, and guide ID hashing done in Rust. Python only constructs `Region`
+objects.
 
 ```python
-from seqchain.operations.score.native_off_target import score_off_targets_native
+from needletail_guides import scan_guides
 
-# Standard SeqChain generators — nothing computed yet
-hits    = regex_map(genome.sequences, preset.pam, topologies=genome.topologies)
-guides  = interpret_guides(hits, genome.sequences, preset, topologies=genome.topologies)
+guides = scan_guides(idx, preset, genome)  # lazy generator
+```
 
-# Native SIMD scorer replaces bowtie — same ScorerFn contract
-scored  = score_off_targets_native(
-    guides, index, genome.sequences, preset.pam,
-    mismatches=2, chunk_size=65536,
+### `score_off_targets_fast()` — Rust-native scoring
+
+Replaces `score_off_targets_native()`. Deduplicates spacers, issues a
+single `search_batch` call with in-Rust PAM validation, counts hits per
+spacer. No chunking, no Python-side coordinate math.
+
+```python
+from needletail_guides import score_off_targets_fast
+
+scored = score_off_targets_fast(
+    guides, index, preset.pam,
+    spacer_len=20, pam_direction="downstream",
+    mismatches=2, max_width=8,
+    topologies=genome.topologies,
 )
 
-# Continue the generator chain as usual
+# Continue the generator chain
 tiles     = anchor_features(genome.genes(), config, genome.chrom_lengths)
 annotated = annotate_tracks(scored, tiles)
 promoters = (g for g in annotated if g.tags.get("feature_type") == "promoter")
 final     = append_tss_distance(promoters)
 
-# Drain — computation starts here
 stream_json_export("output.json", final)
 ```
-
-The `chunk_size=65536` parameter controls the FFI amortization boundary:
-large enough to keep the Rust SIMD cores saturated, small enough that memory
-stays O(chunk).  At 64K guides per batch, the PyO3 serialization cost becomes
-negligible relative to the ~30 s search time.
-
-### Axis 8 compliance
-
-The scorer is a pure streaming generator.  No `sorted()`, no `list()`, no
-materialization beyond the current chunk.  Upstream generators (`regex_map`,
-`interpret_guides`) already produce Regions in genomic coordinate order.  The
-downstream `annotate_tracks` sweep-line consumes them in that order.  Memory
-is O(65536 Regions) regardless of genome size.
 
 ---
 
@@ -279,7 +315,15 @@ idx.warm_seeds("genome.seqchain")
 
 ```python
 spacers = ["ATCGATCGATCGATCGATCG", "TTTTAAAACCCCGGGGAAAA"]
+
+# Basic search
 qi, pos, strand, scores = idx.search_batch(spacers, mismatches=2)
+
+# With PAM validation (no Python post-processing needed)
+qi, pos, strand, scores = idx.search_batch(
+    spacers, mismatches=2, max_width=8,
+    pam="NGG", pam_direction="downstream",
+)
 
 # qi[i]     = index into spacers list for hit i
 # pos[i]    = global genome position
@@ -327,8 +371,10 @@ for verifying the seeded search against.
 | `rkyv` | Zero-copy serialization |
 | `memmap2` | Memory-mapped I/O |
 | `rayon` | Data-parallel search |
+| `sha2` | Guide ID hashing (SHA-256) |
 | `anyhow` | Error handling |
 | `tempfile` | Seed table build scratch |
+| `arrow` + `parquet` | Zero-copy Parquet export |
 
 Release builds use LTO for cross-crate inlining of the SIMD inner loops.
 
