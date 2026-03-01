@@ -1,0 +1,45 @@
+LOCUS       synth_chrom              100 bp    DNA     circular BCT 01-JAN-2024
+DEFINITION  Synthetic chromosome for testing.
+ACCESSION   synth_chrom
+KEYWORDS    .
+SOURCE      Synthetic organism
+  ORGANISM  Synthetic organism
+            Bacteria; Synthetic.
+FEATURES             Location/Qualifiers
+     source          1..100
+                     /organism="Synthetic organism"
+                     /mol_type="genomic DNA"
+     gene            10..30
+                     /gene="geneA"
+                     /locus_tag="SCH_0001"
+     CDS             10..30
+                     /gene="geneA"
+                     /locus_tag="SCH_0001"
+                     /product="hypothetical protein A"
+     gene            complement(50..70)
+                     /gene="geneB"
+                     /locus_tag="SCH_0002"
+     gene            join(90..100,1..15)
+                     /gene="geneC"
+                     /locus_tag="SCH_0003"
+ORIGIN
+        1 atgcatgcat gcatgcatgc atgcatgcat gcatgcatgc atgcatgcat gcatgcatgc
+       61 atgcatgcat gcatgcatgc atgcatgcat gcatgcatgc
+//
+LOCUS       synth_plasmid             50 bp    DNA     linear   BCT 01-JAN-2024
+DEFINITION  Synthetic plasmid for testing.
+ACCESSION   synth_plasmid
+KEYWORDS    .
+SOURCE      Plasmid organism
+  ORGANISM  Plasmid organism
+            Bacteria; Synthetic.
+FEATURES             Location/Qualifiers
+     source          1..50
+                     /organism="Plasmid organism"
+                     /mol_type="genomic DNA"
+     gene            10..40
+                     /gene="geneD"
+                     /locus_tag="SCP_0001"
+ORIGIN
+        1 tgcatgcatg catgcatgca tgcatgcatg catgcatgca tgcatgcatg
+//

@@ -15,10 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pam`, `pam_direction`, and `topologies` enable in-Rust IUPAC bitmask PAM
   filtering. Eliminates Python-side PAM regex validation entirely.
   28x scoring speedup (111 s → 3.95 s for 893K spacers on SacCer3).
-- **`score_off_targets_fast()`** — drop-in replacement for
-  `score_off_targets_native()`. Deduplicates spacers, issues a single
-  `search_batch` call with PAM validation, counts hits per spacer.
-  No chunking, no Python-side coordinate math.
+- **`score_off_targets_fast()`** — streaming drop-in replacement for
+  `score_off_targets_native()` and `score_off_targets()`. Macro-chunked
+  (100K regions via `islice`), deduplicates spacers per chunk, issues one
+  `search_batch` call per chunk with in-Rust PAM validation. O(chunk)
+  memory, Axis 8 (Generator Purity) compliant. Accepts `**kwargs` for
+  `ScorerFn` signature parity with existing SeqChain call sites.
 - **`scan_guides()`** — Rust-native PAM scanning + guide enrichment via
   `FmIndex.scan_guides()`. Replaces `regex_map() + interpret_guides()`.
   All coordinate math, sequence assembly, and SHA-256 guide ID hashing

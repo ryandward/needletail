@@ -258,11 +258,16 @@ from needletail_guides import scan_guides
 guides = scan_guides(idx, preset, genome)  # lazy generator
 ```
 
-### `score_off_targets_fast()` — Rust-native scoring
+### `score_off_targets_fast()` — Streaming Rust-native scoring
 
-Replaces `score_off_targets_native()`. Deduplicates spacers, issues a
-single `search_batch` call with in-Rust PAM validation, counts hits per
-spacer. No chunking, no Python-side coordinate math.
+Drop-in replacement for `score_off_targets()` and `score_off_targets_native()`.
+Pulls 100K regions at a time from the upstream generator via `islice`,
+deduplicates spacers within each chunk, issues a single `search_batch` call
+with in-Rust PAM validation, yields scored Regions one by one, then frees
+the chunk. O(100K) memory — Axis 8 (Generator Purity) compliant.
+
+Accepts `**kwargs` for `ScorerFn` signature parity: extra parameters like
+`sequences=` are silently swallowed so existing call sites work unchanged.
 
 ```python
 from needletail_guides import score_off_targets_fast
@@ -272,6 +277,7 @@ scored = score_off_targets_fast(
     spacer_len=20, pam_direction="downstream",
     mismatches=2, max_width=8,
     topologies=genome.topologies,
+    sequences=genome.sequences,  # accepted, ignored — PAM validated in Rust
 )
 
 # Continue the generator chain

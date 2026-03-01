@@ -1,0 +1,12 @@
+[package]
+name = "needletail-aligner"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "needletail"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3            = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+needletail-core = { path = "../needletail-core" }
