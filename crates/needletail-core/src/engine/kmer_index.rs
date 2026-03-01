@@ -1,26 +1,38 @@
-//! On-disk k-mer seed table: precomputed BWT [l, r] intervals for all 4^K k-mers.
+//! On-disk k-mer seed table: precomputed BWT [l, r] intervals for k-mers.
 //!
-//! At build time, we enumerate every possible k-mer of length K (default 10),
-//! perform an exact backward search in the FM-Index, and write the resulting
-//! BWT interval `(l: u32, r: u32)` to a flat binary file at a deterministic
-//! offset: `kmer_rank * 8`. Invalid intervals (absent k-mers) are stored as
-//! `(u32::MAX, 0)`.
+//! Two storage strategies based on K:
 //!
-//! At query time, we `mmap` this file read-only. For each query, we extract
-//! its trailing K-mer (the suffix consumed first by backward search), compute
-//! mismatch neighborhood variations, look up each variation's BWT interval in
-//! O(1), and seed the frontier directly at depth K — bypassing the exponential
-//! branching of the first K BWT steps entirely.
+//! **Dense (K ≤ 12):** Flat array indexed by 2-bit rank. 4^K × 8 bytes.
+//! O(1) lookup. Absent k-mers stored as `(u32::MAX, 0)`.
 //!
-//! File layout:
+//! **Sparse (K ≥ 13):** Only k-mers present in the genome are stored.
+//! Sorted array of `(rank: u32, l: u32, r: u32)` triples, 12 bytes each.
+//! O(log n) lookup via binary search. For K=14 on a 2 MB genome this is
+//! ~24 MB instead of 2 GB — a ~85× reduction.
+//!
+//! At build time for sparse tables, we scan the genome text to collect
+//! unique k-mer ranks, then perform backward search only for those k-mers.
+//! This reduces build time from 268M searches to ~2M for a typical
+//! microbial genome.
+//!
+//! File layouts:
 //! ```text
-//! offset 0:  [l_0: u32 LE] [r_0: u32 LE]   ← k-mer rank 0 (AAA...A)
-//! offset 8:  [l_1: u32 LE] [r_1: u32 LE]   ← k-mer rank 1 (AAA...C)
-//! ...
-//! offset 8*(4^K - 1): [l_last] [r_last]    ← k-mer rank 4^K-1 (TTT...T)
-//! ```
+//! Dense (K ≤ 12):
+//!   offset 0:  [l_0: u32 LE] [r_0: u32 LE]   ← k-mer rank 0
+//!   offset 8:  [l_1: u32 LE] [r_1: u32 LE]   ← k-mer rank 1
+//!   ...
+//!   Total: 4^K × 8 bytes
 //!
-//! Total size for K=10: 4^10 * 8 = 8,388,608 bytes (8 MiB).
+//! Sparse (K ≥ 13):
+//!   offset 0:  magic "NTKS" (4 bytes)
+//!   offset 4:  K (u32 LE)
+//!   offset 8:  n_entries (u32 LE)
+//!   offset 12: padding (4 bytes, zero)
+//!   offset 16: [rank_0: u32 LE] [l_0: u32 LE] [r_0: u32 LE]  (sorted by rank)
+//!   offset 28: [rank_1: u32 LE] [l_1: u32 LE] [r_1: u32 LE]
+//!   ...
+//!   Total: 16 + n_entries × 12 bytes
+//! ```
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -34,11 +46,14 @@ use super::simd_search::FmOcc;
 /// Used for mm ≤ 2: non-overlapping segments, seed_mm=1, 43 variants max.
 pub const SEED_K_SMALL: usize = 10;
 
-/// Large seed length. 4^14 = 268,435,456 entries × 8 bytes = 2.1 GiB.
+/// Large seed length. Sparse format: only genome-present k-mers stored.
 /// Used for mm = 3: deeper seed shortens BWT to 6 steps, seed_mm=2.
 pub const SEED_K_LARGE: usize = 14;
 
-/// Number of entries in the table: 4^K.
+/// Threshold: K ≤ this uses dense format, K > this uses sparse.
+const SPARSE_THRESHOLD: usize = 12;
+
+/// Number of entries in a dense table: 4^K.
 const fn table_size(k: usize) -> usize {
     1usize << (2 * k) // 4^k
 }
@@ -46,6 +61,15 @@ const fn table_size(k: usize) -> usize {
 /// Sentinel value for absent k-mers (l > r → empty interval).
 const ABSENT_L: u32 = u32::MAX;
 const ABSENT_R: u32 = 0;
+
+/// Magic bytes for sparse format header.
+const SPARSE_MAGIC: [u8; 4] = *b"NTKS";
+
+/// Sparse entry size: rank(4) + l(4) + r(4) = 12 bytes.
+const SPARSE_ENTRY_SIZE: usize = 12;
+
+/// Sparse header size: magic(4) + k(4) + n_entries(4) + padding(4) = 16 bytes.
+const SPARSE_HEADER_SIZE: usize = 16;
 
 /// Encode a DNA base to 2-bit rank: A=0, C=1, G=2, T=3.
 /// Returns `None` for non-ACGT (N, $, etc.).
@@ -68,7 +92,7 @@ pub fn rank_to_base(r: u8) -> u8 {
 
 /// Compute the rank (0-based table offset) of a k-mer sequence.
 /// Returns `None` if any base is not in {A, C, G, T}.
-fn kmer_to_rank(kmer: &[u8]) -> Option<usize> {
+pub fn kmer_to_rank(kmer: &[u8]) -> Option<usize> {
     let mut rank = 0usize;
     for &b in kmer {
         rank = (rank << 2) | base_to_rank(b)? as usize;
@@ -87,13 +111,36 @@ fn rank_to_kmer(mut rank: usize, k: usize) -> Vec<u8> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Build: enumerate all 4^K k-mers, exact backward search, write binary file
+//  Build: dense (all 4^K) or sparse (genome-present only)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Build the k-mer seed table and write it to `out_path`.
-///
-/// Performs 4^K exact backward searches. For K=10 on SacCer3 this takes ~2s.
+/// Automatically selects dense or sparse format based on K.
 pub fn build_kmer_index<I: FmOcc>(index: &I, k: usize, out_path: &Path) -> std::io::Result<()> {
+    if k <= SPARSE_THRESHOLD {
+        build_dense(index, k, out_path)
+    } else {
+        build_sparse(index, k, out_path)
+    }
+}
+
+/// Build a k-mer seed table from genome text + FM-index.
+/// Scans the text for present k-mers, then searches only those.
+pub fn build_kmer_index_from_text<I: FmOcc>(
+    index: &I,
+    text: &[u8],
+    k: usize,
+    out_path: &Path,
+) -> std::io::Result<()> {
+    if k <= SPARSE_THRESHOLD {
+        build_dense(index, k, out_path)
+    } else {
+        build_sparse_from_text(index, text, k, out_path)
+    }
+}
+
+/// Dense build: enumerate all 4^K k-mers, exact backward search.
+fn build_dense<I: FmOcc>(index: &I, k: usize, out_path: &Path) -> std::io::Result<()> {
     let n_entries = table_size(k);
     let file = File::create(out_path)?;
     let mut w = BufWriter::with_capacity(1 << 20, file);
@@ -102,12 +149,94 @@ pub fn build_kmer_index<I: FmOcc>(index: &I, k: usize, out_path: &Path) -> std::
 
     for rank in 0..n_entries {
         let kmer = rank_to_kmer(rank, k);
-
-        // Exact backward search: consume k-mer right-to-left.
         let (l, r) = exact_backward_search(index, &kmer, sa_len);
-
         w.write_all(&(l as u32).to_le_bytes())?;
         w.write_all(&(r as u32).to_le_bytes())?;
+    }
+
+    w.flush()?;
+    Ok(())
+}
+
+/// Sparse build: enumerate all 4^K k-mers (no text available).
+/// Falls back to full enumeration but stores only present entries.
+fn build_sparse<I: FmOcc>(index: &I, k: usize, out_path: &Path) -> std::io::Result<()> {
+    let n_entries = table_size(k);
+    let sa_len = index.sa_len();
+
+    // Collect present k-mers
+    let mut entries: Vec<(u32, u32, u32)> = Vec::new();
+    for rank in 0..n_entries {
+        let kmer = rank_to_kmer(rank, k);
+        let (l, r) = exact_backward_search(index, &kmer, sa_len);
+        if l as u32 != ABSENT_L || r as u32 != ABSENT_R {
+            entries.push((rank as u32, l as u32, r as u32));
+        }
+    }
+
+    write_sparse_file(&entries, k, out_path)
+}
+
+/// Sparse build from genome text: scan for present k-mers first,
+/// then backward-search only those. Much faster for large K.
+fn build_sparse_from_text<I: FmOcc>(
+    index: &I,
+    text: &[u8],
+    k: usize,
+    out_path: &Path,
+) -> std::io::Result<()> {
+    // Scan text for unique k-mer ranks
+    let mut seen = vec![false; table_size(k)];
+    let mut unique_ranks: Vec<usize> = Vec::new();
+
+    if text.len() >= k {
+        for i in 0..=text.len() - k {
+            if let Some(rank) = kmer_to_rank(&text[i..i + k]) {
+                if !seen[rank] {
+                    seen[rank] = true;
+                    unique_ranks.push(rank);
+                }
+            }
+        }
+    }
+    drop(seen);
+    unique_ranks.sort_unstable();
+
+    // Backward-search only present k-mers
+    let sa_len = index.sa_len();
+    let mut entries: Vec<(u32, u32, u32)> = Vec::with_capacity(unique_ranks.len());
+
+    for &rank in &unique_ranks {
+        let kmer = rank_to_kmer(rank, k);
+        let (l, r) = exact_backward_search(index, &kmer, sa_len);
+        if l as u32 != ABSENT_L || r as u32 != ABSENT_R {
+            entries.push((rank as u32, l as u32, r as u32));
+        }
+    }
+
+    write_sparse_file(&entries, k, out_path)
+}
+
+/// Write sparse entries to disk with header.
+fn write_sparse_file(
+    entries: &[(u32, u32, u32)],
+    k: usize,
+    out_path: &Path,
+) -> std::io::Result<()> {
+    let file = File::create(out_path)?;
+    let mut w = BufWriter::with_capacity(1 << 20, file);
+
+    // Header
+    w.write_all(&SPARSE_MAGIC)?;
+    w.write_all(&(k as u32).to_le_bytes())?;
+    w.write_all(&(entries.len() as u32).to_le_bytes())?;
+    w.write_all(&0u32.to_le_bytes())?; // padding
+
+    // Sorted entries
+    for &(rank, l, r) in entries {
+        w.write_all(&rank.to_le_bytes())?;
+        w.write_all(&l.to_le_bytes())?;
+        w.write_all(&r.to_le_bytes())?;
     }
 
     w.flush()?;
@@ -140,41 +269,82 @@ fn exact_backward_search<I: FmOcc>(index: &I, kmer: &[u8], sa_len: usize) -> (us
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Load: memory-mapped read-only table
+//  Load: memory-mapped read-only table (auto-detects format)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Memory-mapped k-mer seed table. 8 bytes per entry, read-only.
+/// Storage variant for the loaded table.
+enum TableFormat {
+    /// Flat array: offset = rank × 8.
+    Dense,
+    /// Sorted (rank, l, r) triples with binary search.
+    Sparse { n_entries: usize },
+}
+
+/// Memory-mapped k-mer seed table. Supports both dense and sparse formats.
 pub struct KmerSeedTable {
     mmap: Mmap,
     k: usize,
+    format: TableFormat,
 }
 
-// SAFETY: Mmap is Send+Sync (read-only view of a file). usize is trivially so.
+// SAFETY: Mmap is Send+Sync (read-only view of a file). All other fields are trivially so.
 unsafe impl Send for KmerSeedTable {}
 unsafe impl Sync for KmerSeedTable {}
 
 impl KmerSeedTable {
-    /// Open an existing k-mer index file via `mmap`.
+    /// Open an existing k-mer index file via `mmap`. Auto-detects format.
     pub fn open(path: &Path, k: usize) -> std::io::Result<Self> {
-        let expected = table_size(k) * 8;
-        let meta = fs::metadata(path)?;
-        if meta.len() != expected as u64 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "kmer index size mismatch: expected {} bytes for k={}, got {}",
-                    expected,
-                    k,
-                    meta.len()
-                ),
-            ));
-        }
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        Ok(KmerSeedTable { mmap, k })
+
+        let format = Self::detect_format(&mmap, k)?;
+        Ok(KmerSeedTable { mmap, k, format })
     }
 
-    /// Build (if missing) then open. Returns the table and the path used.
+    /// Detect whether the file is dense or sparse.
+    fn detect_format(mmap: &Mmap, k: usize) -> std::io::Result<TableFormat> {
+        // Check for sparse magic header
+        if mmap.len() >= SPARSE_HEADER_SIZE && mmap[0..4] == SPARSE_MAGIC {
+            let stored_k = u32::from_le_bytes([mmap[4], mmap[5], mmap[6], mmap[7]]) as usize;
+            let n_entries =
+                u32::from_le_bytes([mmap[8], mmap[9], mmap[10], mmap[11]]) as usize;
+
+            if stored_k != k {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("sparse index k mismatch: file has k={}, expected k={}", stored_k, k),
+                ));
+            }
+
+            let expected = SPARSE_HEADER_SIZE + n_entries * SPARSE_ENTRY_SIZE;
+            if mmap.len() != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "sparse index size mismatch: expected {} bytes for {} entries, got {}",
+                        expected, n_entries, mmap.len()
+                    ),
+                ));
+            }
+
+            Ok(TableFormat::Sparse { n_entries })
+        } else {
+            // Dense format: validate size
+            let expected = table_size(k) * 8;
+            if mmap.len() != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "dense index size mismatch: expected {} bytes for k={}, got {}",
+                        expected, k, mmap.len()
+                    ),
+                ));
+            }
+            Ok(TableFormat::Dense)
+        }
+    }
+
+    /// Build (if missing) then open.
     pub fn open_or_build<I: FmOcc>(
         index: &I,
         fasta_path: &str,
@@ -183,6 +353,20 @@ impl KmerSeedTable {
         let idx_path = kmer_index_path(fasta_path, k);
         if !idx_path.exists() {
             build_kmer_index(index, k, &idx_path)?;
+        }
+        Self::open(&idx_path, k)
+    }
+
+    /// Build from genome text (if missing) then open. Uses sparse scan for large K.
+    pub fn open_or_build_from_text<I: FmOcc>(
+        index: &I,
+        text: &[u8],
+        fasta_path: &str,
+        k: usize,
+    ) -> std::io::Result<Self> {
+        let idx_path = kmer_index_path(fasta_path, k);
+        if !idx_path.exists() {
+            build_kmer_index_from_text(index, text, k, &idx_path)?;
         }
         Self::open(&idx_path, k)
     }
@@ -197,6 +381,14 @@ impl KmerSeedTable {
     /// Returns `None` if the k-mer is absent in the genome.
     #[inline]
     pub fn lookup_rank(&self, rank: usize) -> Option<(u32, u32)> {
+        match self.format {
+            TableFormat::Dense => self.lookup_rank_dense(rank),
+            TableFormat::Sparse { n_entries } => self.lookup_rank_sparse(rank, n_entries),
+        }
+    }
+
+    #[inline]
+    fn lookup_rank_dense(&self, rank: usize) -> Option<(u32, u32)> {
         let offset = rank * 8;
         let bytes = &self.mmap[offset..offset + 8];
 
@@ -210,11 +402,65 @@ impl KmerSeedTable {
         }
     }
 
+    #[inline]
+    fn lookup_rank_sparse(&self, rank: usize, n_entries: usize) -> Option<(u32, u32)> {
+        let rank = rank as u32;
+        let data = &self.mmap[SPARSE_HEADER_SIZE..];
+
+        // Binary search over sorted (rank, l, r) triples
+        let mut lo = 0usize;
+        let mut hi = n_entries;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let off = mid * SPARSE_ENTRY_SIZE;
+            let entry_rank =
+                u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+
+            if entry_rank < rank {
+                lo = mid + 1;
+            } else if entry_rank > rank {
+                hi = mid;
+            } else {
+                let l = u32::from_le_bytes(
+                    [data[off + 4], data[off + 5], data[off + 6], data[off + 7]],
+                );
+                let r = u32::from_le_bytes(
+                    [data[off + 8], data[off + 9], data[off + 10], data[off + 11]],
+                );
+                return Some((l, r));
+            }
+        }
+        None
+    }
+
     /// Look up a k-mer byte slice. Returns `None` if absent or contains non-ACGT.
     #[inline]
     pub fn lookup(&self, kmer: &[u8]) -> Option<(u32, u32)> {
         let rank = kmer_to_rank(kmer)?;
         self.lookup_rank(rank)
+    }
+
+    /// Number of present k-mers in the table.
+    pub fn n_entries(&self) -> usize {
+        match self.format {
+            TableFormat::Dense => {
+                // Count non-absent entries (expensive, mainly for diagnostics)
+                let n = table_size(self.k);
+                let mut count = 0;
+                for rank in 0..n {
+                    if self.lookup_rank_dense(rank).is_some() {
+                        count += 1;
+                    }
+                }
+                count
+            }
+            TableFormat::Sparse { n_entries } => n_entries,
+        }
+    }
+
+    /// Whether this table uses the sparse format.
+    pub fn is_sparse(&self) -> bool {
+        matches!(self.format, TableFormat::Sparse { .. })
     }
 }
 
@@ -225,20 +471,38 @@ impl KmerSeedTable {
 /// In-memory table mapping each k-mer rank to a sorted list of genome positions
 /// where that k-mer occurs. Used by the verify phase to avoid random SA lookups.
 ///
-/// Memory: offset table (4^K × 4 bytes) + position data (~text_len × 4 bytes).
-/// For SacCer3 with K=10: ~4MB + ~48MB = ~52MB.
+/// For K ≤ 12: flat offset array (4^K × 4 bytes) + position data.
+/// For K ≥ 13: hash map from rank to position slice boundaries.
 pub struct PosTable {
-    /// `offsets[rank]` = start index in `positions` for this k-mer rank.
-    /// `offsets[4^K]` = total number of positions (sentinel).
-    offsets: Vec<u32>,
-    /// All genome positions, partitioned by k-mer rank.
-    positions: Vec<u32>,
+    inner: PosTableInner,
     k: usize,
+}
+
+enum PosTableInner {
+    /// Dense: offset table (4^K + 1 entries) + position data.
+    Dense {
+        offsets: Vec<u32>,
+        positions: Vec<u32>,
+    },
+    /// Sparse: sorted (rank, offset_start, offset_end) + position data.
+    Sparse {
+        /// Sorted by rank for binary search.
+        index: Vec<(u32, u32, u32)>,
+        positions: Vec<u32>,
+    },
 }
 
 impl PosTable {
     /// Build from the concatenated genome text. Two-pass: count then fill.
     pub fn build(text: &[u8], k: usize) -> Self {
+        if k <= SPARSE_THRESHOLD {
+            Self::build_dense(text, k)
+        } else {
+            Self::build_sparse(text, k)
+        }
+    }
+
+    fn build_dense(text: &[u8], k: usize) -> Self {
         let n_entries = table_size(k);
 
         // First pass: count occurrences per k-mer rank.
@@ -271,15 +535,67 @@ impl PosTable {
             }
         }
 
-        PosTable { offsets, positions, k }
+        PosTable {
+            inner: PosTableInner::Dense { offsets, positions },
+            k,
+        }
+    }
+
+    fn build_sparse(text: &[u8], k: usize) -> Self {
+        use std::collections::HashMap;
+
+        // Single pass: collect positions per rank using a hash map.
+        let mut map: HashMap<u32, Vec<u32>> = HashMap::new();
+        if text.len() >= k {
+            for i in 0..=text.len() - k {
+                if let Some(rank) = kmer_to_rank(&text[i..i + k]) {
+                    map.entry(rank as u32).or_default().push(i as u32);
+                }
+            }
+        }
+
+        // Sort ranks and flatten into contiguous position array.
+        let mut sorted_ranks: Vec<u32> = map.keys().copied().collect();
+        sorted_ranks.sort_unstable();
+
+        let total: usize = map.values().map(|v| v.len()).sum();
+        let mut positions = Vec::with_capacity(total);
+        let mut index = Vec::with_capacity(sorted_ranks.len());
+
+        for &rank in &sorted_ranks {
+            let start = positions.len() as u32;
+            let poses = map.get(&rank).unwrap();
+            positions.extend_from_slice(poses);
+            let end = positions.len() as u32;
+            index.push((rank, start, end));
+        }
+
+        PosTable {
+            inner: PosTableInner::Sparse { index, positions },
+            k,
+        }
     }
 
     /// Genome positions where the k-mer with the given rank occurs.
     #[inline]
     pub fn positions_for_rank(&self, rank: usize) -> &[u32] {
-        let start = self.offsets[rank] as usize;
-        let end = self.offsets[rank + 1] as usize;
-        &self.positions[start..end]
+        match &self.inner {
+            PosTableInner::Dense { offsets, positions } => {
+                let start = offsets[rank] as usize;
+                let end = offsets[rank + 1] as usize;
+                &positions[start..end]
+            }
+            PosTableInner::Sparse { index, positions } => {
+                let rank = rank as u32;
+                match index.binary_search_by_key(&rank, |&(r, _, _)| r) {
+                    Ok(i) => {
+                        let (_, start, end) = index[i];
+                        &positions[start as usize..end as usize]
+                    }
+                    Err(_) => &[],
+                }
+            }
+        }
     }
 
     /// Seed length K.
@@ -299,4 +615,65 @@ pub fn kmer_index_path(fasta_path: &str, k: usize) -> PathBuf {
     let stem = p.file_stem().unwrap_or_default().to_string_lossy();
     let parent = p.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!("{}.{}mer.idx", stem, k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kmer_rank_roundtrip() {
+        for k in [4, 10, 14] {
+            for rank in [0, 1, 42, table_size(k) - 1] {
+                let kmer = rank_to_kmer(rank, k);
+                assert_eq!(kmer.len(), k);
+                assert_eq!(kmer_to_rank(&kmer), Some(rank));
+            }
+        }
+    }
+
+    #[test]
+    fn test_sparse_write_read() {
+        let dir = std::env::temp_dir().join("needletail_test_sparse");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("test.14mer.idx");
+
+        let entries = vec![
+            (100u32, 10u32, 20u32),
+            (200, 30, 40),
+            (500, 50, 60),
+        ];
+        write_sparse_file(&entries, 14, &path).unwrap();
+
+        let table = KmerSeedTable::open(&path, 14).unwrap();
+        assert!(table.is_sparse());
+        assert_eq!(table.n_entries(), 3);
+
+        assert_eq!(table.lookup_rank(100), Some((10, 20)));
+        assert_eq!(table.lookup_rank(200), Some((30, 40)));
+        assert_eq!(table.lookup_rank(500), Some((50, 60)));
+        assert_eq!(table.lookup_rank(0), None);
+        assert_eq!(table.lookup_rank(150), None);
+        assert_eq!(table.lookup_rank(999), None);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_pos_table_sparse() {
+        // Simulate a small genome: ACGTACGT (8 bp)
+        let text = b"ACGTACGT";
+        let k = 4;
+
+        let dense = PosTable::build_dense(text, k);
+        let sparse = PosTable::build_sparse(text, k);
+
+        // Both should give same results for all k-mers
+        let n_entries = table_size(k);
+        for rank in 0..n_entries {
+            let d = dense.positions_for_rank(rank);
+            let s = sparse.positions_for_rank(rank);
+            assert_eq!(d, s, "mismatch at rank {}", rank);
+        }
+    }
 }

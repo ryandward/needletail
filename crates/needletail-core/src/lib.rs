@@ -223,11 +223,11 @@ pub fn build_seed_tiers<I: FmOcc>(
     text: &[u8],
     fasta_path: &str,
 ) -> Result<(SeedTier, SeedTier), String> {
-    let seed_small = KmerSeedTable::open_or_build(index, fasta_path, SEED_K_SMALL)
+    let seed_small = KmerSeedTable::open_or_build_from_text(index, text, fasta_path, SEED_K_SMALL)
         .map_err(|e| format!("Failed to build/load K={} seed table: {}", SEED_K_SMALL, e))?;
     let pos_small = PosTable::build(text, SEED_K_SMALL);
 
-    let seed_large = KmerSeedTable::open_or_build(index, fasta_path, SEED_K_LARGE)
+    let seed_large = KmerSeedTable::open_or_build_from_text(index, text, fasta_path, SEED_K_LARGE)
         .map_err(|e| format!("Failed to build/load K={} seed table: {}", SEED_K_LARGE, e))?;
     let pos_large = PosTable::build(text, SEED_K_LARGE);
 
@@ -286,13 +286,13 @@ pub fn build_seed_tier_for_handle(
 
     let table = match handle {
         IndexHandle::Built(s) => {
-            KmerSeedTable::open_or_build(&**s, "<mmap>", k).ok()
+            KmerSeedTable::open_or_build_from_text(&**s, text, "<mmap>", k).ok()
         }
         IndexHandle::Loaded(_m) => {
             if kmer_path.exists() {
                 KmerSeedTable::open(&kmer_path, k).ok()
             } else {
-                engine::kmer_index::build_kmer_index(&**_m, k, &kmer_path)
+                engine::kmer_index::build_kmer_index_from_text(&**_m, text, k, &kmer_path)
                     .ok()
                     .and_then(|()| KmerSeedTable::open(&kmer_path, k).ok())
             }
