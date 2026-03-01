@@ -9,6 +9,7 @@
 mod error;
 mod fm_index;
 mod kmer_index;
+mod parquet_sink;
 mod persist;
 mod simd_search;
 
@@ -70,6 +71,7 @@ fn run_search_unseeded<I: FmOcc + Send + Sync>(
     queries_rc: &[Vec<u8>],
     query_len: usize,
     mismatches: u8,
+    max_width: u32,
     chroms: &ChromGeometry,
 ) -> HitAccumulator {
     let mut acc = HitAccumulator::new();
@@ -79,6 +81,7 @@ fn run_search_unseeded<I: FmOcc + Send + Sync>(
         queries_rc,
         query_len,
         mismatches,
+        max_width,
         chroms,
         &mut acc,
     );
@@ -94,6 +97,7 @@ fn run_search_seeded<I: FmOcc + Send + Sync>(
     queries_rc: &[Vec<u8>],
     query_len: usize,
     mismatches: u8,
+    max_width: u32,
     chroms: &ChromGeometry,
 ) -> Result<HitAccumulator, crate::error::SearchError> {
     use rayon::prelude::*;
@@ -126,6 +130,7 @@ fn run_search_seeded<I: FmOcc + Send + Sync>(
                 &queries_rc[start..end],
                 query_len,
                 mismatches,
+                max_width,
                 chroms,
                 &mut acc,
             )?;
@@ -402,12 +407,13 @@ impl FmIndex {
     ///   mm = 3 → K=14 seed tier (deeper seed, fewer BWT steps)
     ///
     /// Returns `(query_indices, positions, strands, scores)` — four parallel lists.
-    #[pyo3(signature = (queries, mismatches=0))]
+    #[pyo3(signature = (queries, mismatches=0, max_width=u32::MAX))]
     fn search_batch(
         &self,
         py: Python<'_>,
         queries: Vec<String>,
         mismatches: u8,
+        max_width: u32,
     ) -> PyResult<(Vec<u32>, Vec<u32>, Vec<bool>, Vec<f32>)> {
         if queries.is_empty() {
             return Ok((vec![], vec![], vec![], vec![]));
@@ -437,6 +443,7 @@ impl FmIndex {
                             &queries_rc,
                             query_len,
                             mismatches,
+                            max_width,
                             &chroms,
                         )
                     });
@@ -460,6 +467,7 @@ impl FmIndex {
                             &queries_rc,
                             query_len,
                             mismatches,
+                            max_width,
                             &chroms,
                         )
                     });
@@ -483,6 +491,7 @@ impl FmIndex {
                             &queries_rc,
                             query_len,
                             mismatches,
+                            max_width,
                             &chroms,
                         )
                     });
@@ -497,6 +506,7 @@ impl FmIndex {
                             &queries_rc,
                             query_len,
                             mismatches,
+                            max_width,
                             &chroms,
                         )
                     });
@@ -535,6 +545,7 @@ impl FmIndex {
                         &queries_rc,
                         query_len,
                         mismatches,
+                        u32::MAX,
                         &chroms,
                     )
                 });
@@ -549,12 +560,97 @@ impl FmIndex {
                         &queries_rc,
                         query_len,
                         mismatches,
+                        u32::MAX,
                         &chroms,
                     )
                 });
                 Ok((hits.query_id, hits.position, hits.strand, hits.score))
             }
         }
+    }
+
+    /// Search and write results directly to a Parquet file.
+    ///
+    /// Zero-allocation pipeline: wavefront survivors push raw bits into Arrow
+    /// columnar builders, then flush to a `.parquet` sidecar in one shot.
+    /// Returns the number of hits written.
+    #[pyo3(signature = (queries, output_path, mismatches=0, max_width=u32::MAX))]
+    fn search_to_parquet(
+        &self,
+        py: Python<'_>,
+        queries: Vec<String>,
+        output_path: &str,
+        mismatches: u8,
+        max_width: u32,
+    ) -> PyResult<usize> {
+        if queries.is_empty() {
+            return Ok(0);
+        }
+
+        let (query_len, queries_fwd, queries_rc) =
+            Self::prepare_queries(&queries, mismatches)?;
+
+        let chroms = self.inner.chrom_geometry();
+        let out_path = std::path::PathBuf::from(output_path);
+
+        // Run search (reuse existing path to get HitAccumulator).
+        let acc = if let Some((tier, _k)) = self.select_tier(mismatches, query_len) {
+            let seed_table = tier.seed_table.clone();
+            let pos_table = tier.pos_table.clone();
+
+            match &self.inner {
+                IndexInner::Built(index) => {
+                    let index = index.clone();
+                    py.allow_threads(move || {
+                        run_search_seeded(
+                            &*index, &seed_table, &pos_table, index.text(),
+                            &queries_fwd, &queries_rc, query_len, mismatches,
+                            max_width, &chroms,
+                        )
+                    })
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                }
+                IndexInner::Loaded(index) => {
+                    let index = index.clone();
+                    py.allow_threads(move || {
+                        run_search_seeded(
+                            &*index, &seed_table, &pos_table, index.text(),
+                            &queries_fwd, &queries_rc, query_len, mismatches,
+                            max_width, &chroms,
+                        )
+                    })
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?
+                }
+            }
+        } else {
+            match &self.inner {
+                IndexInner::Built(index) => {
+                    let index = index.clone();
+                    py.allow_threads(move || {
+                        run_search_unseeded(
+                            &*index, &queries_fwd, &queries_rc,
+                            query_len, mismatches, max_width, &chroms,
+                        )
+                    })
+                }
+                IndexInner::Loaded(index) => {
+                    let index = index.clone();
+                    py.allow_threads(move || {
+                        run_search_unseeded(
+                            &*index, &queries_fwd, &queries_rc,
+                            query_len, mismatches, max_width, &chroms,
+                        )
+                    })
+                }
+            }
+        };
+
+        // Sink directly to Parquet via Arrow builders — zero string allocation.
+        let chroms_geo = self.inner.chrom_geometry();
+        let n_rows = parquet_sink::hits_to_parquet(&acc, &chroms_geo, &out_path)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+
+        Ok(n_rows)
     }
 
     /// Chromosome names in FASTA order (index = chrom_id).

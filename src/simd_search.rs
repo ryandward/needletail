@@ -24,7 +24,7 @@ use memmap2::Mmap;
 use tempfile::tempfile;
 
 use crate::fm_index::{RankBlock, BLOCK_SIZE};
-use crate::kmer_index::{self, KmerSeed, KmerSeedTable, PosTable};
+use crate::kmer_index::{KmerSeedTable, PosTable};
 
 // Precomputed score table: score[mm] = 1.0 / (1.0 + mm)
 const SCORE_LUT: [f32; 4] = [1.0, 0.5, 1.0 / 3.0, 0.25];
@@ -594,6 +594,7 @@ pub fn step_depth<I: FmOcc>(
     queries_fwd: &[Vec<u8>],
     queries_rc: &[Vec<u8>],
     max_mm: u8,
+    max_width: u32,
     chroms: &ChromGeometry,
     hits: &mut HitAccumulator,
     next: &mut SearchFrontier,
@@ -645,7 +646,12 @@ pub fn step_depth<I: FmOcc>(
             let nr_exc = (less_b + occ_r) as u32;
             let mm_cost = (base != qchar[i]) as u8;
             let new_bud = frontier.budget[i].saturating_sub(mm_cost);
-            let valid = (nl < nr_exc) & (frontier.budget[i] >= mm_cost);
+            let width = nr_exc.wrapping_sub(nl);
+            // Prune mismatch branches in repetitive regions (width > cap).
+            // Exact-match branches (cost=0) always survive regardless of width.
+            let valid = (nl < nr_exc)
+                & (frontier.budget[i] >= mm_cost)
+                & (mm_cost == 0 || width <= max_width);
             c_l.push(nl);
             c_r.push(nr_exc.wrapping_sub(1));
             c_bud.push(new_bud);
@@ -811,6 +817,475 @@ unsafe fn rank_all_blocks_sse(blocks: &[RankBlock], pos: usize) -> std::arch::x8
     );
 
     _mm_add_epi32(base_counts, pop)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  AVX2 Wavefront Primitives — 8-wide vectorized rank via gather
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Vectorized 32-bit lane popcount using nibble-lookup.
+///
+/// Each 32-bit lane's population count is computed entirely in SIMD:
+///   1. Split each byte into low/high nibbles
+///   2. Use `vpshufb` as a 4-bit → popcount LUT (0→0, 1→1, ..., F→4)
+///   3. Sum byte popcounts within each 32-bit lane via `vpmaddubsw` + `vpmaddwd`
+///
+/// Zero branches, zero scalar extraction. ~3 cycles throughput.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_popcount_epi32(v: std::arch::x86_64::__m256i) -> std::arch::x86_64::__m256i {
+    use std::arch::x86_64::*;
+
+    let low_mask = _mm256_set1_epi8(0x0F);
+    let lookup = _mm256_setr_epi8(
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, // lane 0
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, // lane 1
+    );
+    let lo = _mm256_shuffle_epi8(lookup, _mm256_and_si256(v, low_mask));
+    let hi = _mm256_shuffle_epi8(
+        lookup,
+        _mm256_and_si256(_mm256_srli_epi16(v, 4), low_mask),
+    );
+    let byte_pop = _mm256_add_epi8(lo, hi);
+    // Reduce bytes→32-bit: maddubs pairs u8→i16, madd pairs i16→i32
+    let word_pop = _mm256_maddubs_epi16(byte_pop, _mm256_set1_epi8(1));
+    _mm256_madd_epi16(word_pop, _mm256_set1_epi16(1))
+}
+
+/// 8-position vectorized rank computation using AVX2 gathers.
+///
+/// For each of 4 bases, computes `rank(pos)` = count of that base in `BWT[0..=pos]`
+/// for all 8 positions simultaneously. Uses `_mm256_i32gather_epi32` to load
+/// counts and bitvectors from the cache-line-aligned `RankBlock` array.
+///
+/// **Memory layout**: Each `RankBlock` is 16 × i32 (64 bytes):
+/// ```text
+/// [0..3]   counts[A,C,G,T]    — absolute cumulative before block start
+/// [4..7]   bv_lo[A,C,G,T]     — bitvectors for positions 0..31
+/// [8..11]  bv_hi[A,C,G,T]     — bitvectors for positions 32..63
+/// [12..15] mid[A,C,G,T]       — absolute cumulative at block_start + 32
+/// ```
+///
+/// **Sentinel handling**: positions equal to `u32::MAX` (the `l=0` case where
+/// `rank(l-1)` should be zero) produce all-zero results.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rank_8way_avx2(
+    blocks_ptr: *const i32,
+    positions: [u32; 8],
+) -> [[u32; 4]; 8] {
+    use std::arch::x86_64::*;
+
+    let pos_v = _mm256_loadu_si256(positions.as_ptr() as *const __m256i);
+
+    // Sentinel mask: lanes where pos == u32::MAX (l=0 case)
+    let sentinel = _mm256_cmpeq_epi32(pos_v, _mm256_set1_epi32(-1i32));
+    let valid_mask = _mm256_andnot_si256(sentinel, _mm256_set1_epi32(-1i32));
+
+    // Clamp sentinels to 0 to avoid wild gather addresses
+    let pos_safe = _mm256_andnot_si256(sentinel, pos_v);
+
+    // block_idx = pos >> 6
+    let block_idx = _mm256_srli_epi32(pos_safe, 6);
+    // offset = pos & 63
+    let offset = _mm256_and_si256(pos_safe, _mm256_set1_epi32(63));
+    // is_hi: offset >= 32 → all-ones mask per lane
+    let is_hi = _mm256_cmpgt_epi32(offset, _mm256_set1_epi32(31));
+
+    // off_in_half = offset & 31 (0..31 within the lo or hi bitvector)
+    let off_in_half = _mm256_and_si256(offset, _mm256_set1_epi32(31));
+    // Inclusive mask: (1 << (off_in_half + 1)) - 1
+    // When off_in_half = 31, shift = 32, sllv produces 0, then 0 - 1 = 0xFFFFFFFF. Correct.
+    let one = _mm256_set1_epi32(1);
+    let shift = _mm256_add_epi32(off_in_half, one);
+    let inc_mask = _mm256_sub_epi32(_mm256_sllv_epi32(one, shift), one);
+
+    // base_offset = block_idx * 16 (16 i32s per RankBlock)
+    let base_off = _mm256_slli_epi32(block_idx, 4);
+
+    let mut result = [[0u32; 4]; 8];
+
+    for b in 0..4u32 {
+        let b_i32 = b as i32;
+
+        // lo path: count at base_off + b, bv at base_off + 4 + b
+        let count_idx_lo = _mm256_add_epi32(base_off, _mm256_set1_epi32(b_i32));
+        let bv_idx_lo = _mm256_add_epi32(base_off, _mm256_set1_epi32(4 + b_i32));
+
+        // hi path: count at base_off + 12 + b (mid), bv at base_off + 8 + b (bv_hi)
+        let count_idx_hi = _mm256_add_epi32(base_off, _mm256_set1_epi32(12 + b_i32));
+        let bv_idx_hi = _mm256_add_epi32(base_off, _mm256_set1_epi32(8 + b_i32));
+
+        // Blend: select hi path where offset >= 32
+        let count_idx = _mm256_blendv_epi8(count_idx_lo, count_idx_hi, is_hi);
+        let bv_idx = _mm256_blendv_epi8(bv_idx_lo, bv_idx_hi, is_hi);
+
+        // Gather counts and bitvectors (2 gathers per base)
+        let counts = _mm256_i32gather_epi32::<4>(blocks_ptr, count_idx);
+        let bvs = _mm256_i32gather_epi32::<4>(blocks_ptr, bv_idx);
+
+        // Mask bitvectors, popcount, accumulate
+        let masked_bvs = _mm256_and_si256(bvs, inc_mask);
+        let popcounts = avx2_popcount_epi32(masked_bvs);
+        let rank = _mm256_add_epi32(counts, popcounts);
+
+        // Zero out sentinel lanes
+        let rank_masked = _mm256_and_si256(rank, valid_mask);
+
+        // Extract to result array
+        let mut rank_arr = [0u32; 8];
+        _mm256_storeu_si256(rank_arr.as_mut_ptr() as *mut __m256i, rank_masked);
+        for i in 0..8 {
+            result[i][b as usize] = rank_arr[i];
+        }
+    }
+
+    result
+}
+
+/// 16-position interleaved rank computation using AVX2 gathers.
+///
+/// Computes ranks for two independent batches of 8 positions simultaneously,
+/// interleaving gather instructions across the l-batch and r-batch so that the
+/// 11-12 cycle gather latency of one batch overlaps with the arithmetic of the
+/// other. This saturates Port 5 (shuffle) and Port 0/1 (ALU) simultaneously,
+/// improving throughput over two sequential `rank_8way_avx2` calls.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn rank_16way_interleaved(
+    blocks_ptr: *const i32,
+    positions_a: [u32; 8],
+    positions_b: [u32; 8],
+) -> ([[u32; 4]; 8], [[u32; 4]; 8]) {
+    use std::arch::x86_64::*;
+
+    let neg1 = _mm256_set1_epi32(-1i32);
+    let one = _mm256_set1_epi32(1);
+    let mask63 = _mm256_set1_epi32(63);
+    let mask31 = _mm256_set1_epi32(31);
+    let thresh31 = _mm256_set1_epi32(31);
+
+    // ── Setup batch A (l positions) ──────────────────────────────────────
+    let pos_a = _mm256_loadu_si256(positions_a.as_ptr() as *const __m256i);
+    let sentinel_a = _mm256_cmpeq_epi32(pos_a, neg1);
+    let valid_mask_a = _mm256_andnot_si256(sentinel_a, neg1);
+    let pos_safe_a = _mm256_andnot_si256(sentinel_a, pos_a);
+    let block_idx_a = _mm256_srli_epi32(pos_safe_a, 6);
+    let offset_a = _mm256_and_si256(pos_safe_a, mask63);
+    let is_hi_a = _mm256_cmpgt_epi32(offset_a, thresh31);
+    let off_in_half_a = _mm256_and_si256(offset_a, mask31);
+    let inc_mask_a = _mm256_sub_epi32(
+        _mm256_sllv_epi32(one, _mm256_add_epi32(off_in_half_a, one)),
+        one,
+    );
+    let base_off_a = _mm256_slli_epi32(block_idx_a, 4);
+
+    // ── Setup batch B (r positions) ──────────────────────────────────────
+    let pos_b = _mm256_loadu_si256(positions_b.as_ptr() as *const __m256i);
+    let sentinel_b = _mm256_cmpeq_epi32(pos_b, neg1);
+    let valid_mask_b = _mm256_andnot_si256(sentinel_b, neg1);
+    let pos_safe_b = _mm256_andnot_si256(sentinel_b, pos_b);
+    let block_idx_b = _mm256_srli_epi32(pos_safe_b, 6);
+    let offset_b = _mm256_and_si256(pos_safe_b, mask63);
+    let is_hi_b = _mm256_cmpgt_epi32(offset_b, thresh31);
+    let off_in_half_b = _mm256_and_si256(offset_b, mask31);
+    let inc_mask_b = _mm256_sub_epi32(
+        _mm256_sllv_epi32(one, _mm256_add_epi32(off_in_half_b, one)),
+        one,
+    );
+    let base_off_b = _mm256_slli_epi32(block_idx_b, 4);
+
+    let mut result_a = [[0u32; 4]; 8];
+    let mut result_b = [[0u32; 4]; 8];
+
+    for b in 0..4u32 {
+        let b_i32 = b as i32;
+
+        // ── 1. ADDRESS COMPUTATION — both batches (independent) ──────────
+        // Batch A: lo/hi index selection
+        let count_idx_a = _mm256_blendv_epi8(
+            _mm256_add_epi32(base_off_a, _mm256_set1_epi32(b_i32)),       // lo: base_off + b
+            _mm256_add_epi32(base_off_a, _mm256_set1_epi32(12 + b_i32)), // hi: base_off + 12 + b
+            is_hi_a,
+        );
+        let bv_idx_a = _mm256_blendv_epi8(
+            _mm256_add_epi32(base_off_a, _mm256_set1_epi32(4 + b_i32)),  // lo: base_off + 4 + b
+            _mm256_add_epi32(base_off_a, _mm256_set1_epi32(8 + b_i32)),  // hi: base_off + 8 + b
+            is_hi_a,
+        );
+
+        // Batch B: lo/hi index selection
+        let count_idx_b = _mm256_blendv_epi8(
+            _mm256_add_epi32(base_off_b, _mm256_set1_epi32(b_i32)),
+            _mm256_add_epi32(base_off_b, _mm256_set1_epi32(12 + b_i32)),
+            is_hi_b,
+        );
+        let bv_idx_b = _mm256_blendv_epi8(
+            _mm256_add_epi32(base_off_b, _mm256_set1_epi32(4 + b_i32)),
+            _mm256_add_epi32(base_off_b, _mm256_set1_epi32(8 + b_i32)),
+            is_hi_b,
+        );
+
+        // ── 2. INTERLEAVED GATHERS — overlap gather latency ─────────────
+        let counts_a = _mm256_i32gather_epi32::<4>(blocks_ptr, count_idx_a); // A count gather fires
+        let counts_b = _mm256_i32gather_epi32::<4>(blocks_ptr, count_idx_b); // B dispatches while A waits
+        let bvs_a = _mm256_i32gather_epi32::<4>(blocks_ptr, bv_idx_a);      // A's counts likely ready
+        let bvs_b = _mm256_i32gather_epi32::<4>(blocks_ptr, bv_idx_b);      // overlap continues
+
+        // ── 3. INTERLEAVED MATH — arithmetic while late gathers land ────
+        let masked_a = _mm256_and_si256(bvs_a, inc_mask_a);
+        let pop_a = avx2_popcount_epi32(masked_a);       // Port 5 shuffle chain
+        let masked_b = _mm256_and_si256(bvs_b, inc_mask_b);
+        let pop_b = avx2_popcount_epi32(masked_b);       // Port 0/1 ALU overlaps
+
+        // ── 4. ACCUMULATE + sentinel mask ────────────────────────────────
+        let rank_a = _mm256_and_si256(_mm256_add_epi32(counts_a, pop_a), valid_mask_a);
+        let rank_b = _mm256_and_si256(_mm256_add_epi32(counts_b, pop_b), valid_mask_b);
+
+        // ── 5. EXTRACT — interleaved stores to overlap SLF stalls ───────
+        let mut arr_a = [0u32; 8];
+        let mut arr_b = [0u32; 8];
+        _mm256_storeu_si256(arr_a.as_mut_ptr() as *mut __m256i, rank_a);
+        _mm256_storeu_si256(arr_b.as_mut_ptr() as *mut __m256i, rank_b);
+        for i in 0..8 {
+            result_a[i][b as usize] = arr_a[i];
+            result_b[i][b as usize] = arr_b[i];
+        }
+    }
+
+    (result_a, result_b)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Vectorized Pigeonhole Filter + SIMD Hamming Verification
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Exact-match pigeonhole filter: splits each query into `max_mm + 1` segments
+/// and performs a 0-mismatch BWT backward search on each segment using AVX2.
+///
+/// By the pigeonhole principle, any alignment with ≤ max_mm mismatches must have
+/// at least one segment that matches exactly. Seeds with non-empty BWT intervals
+/// (survivors) are returned for SA resolution and Hamming verification.
+///
+/// Returns `(surv_l, surv_r, surv_qid, surv_seg, surv_strand)`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn exact_pigeonhole_filter(
+    blocks_ptr: *const i32,
+    less_arr: &[u32; 4],
+    bwt_len: u32,
+    queries_fwd: &[Vec<u8>],
+    queries_rc: &[Vec<u8>],
+    query_len: usize,
+    max_mm: u8,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u8>) {
+    use std::arch::x86_64::*;
+
+    let n_queries = queries_fwd.len();
+    let n_seg = max_mm as usize + 1;
+    let n_qs = n_queries * 2; // number of query-strand pairs
+
+    // Dynamic segment partition.
+    let base_len = query_len / n_seg;
+    let remainder = query_len % n_seg;
+    let mut seg_bounds: Vec<(usize, usize)> = Vec::with_capacity(n_seg);
+    {
+        let mut pos = 0;
+        for s in 0..n_seg {
+            let slen = base_len + if s < remainder { 1 } else { 0 };
+            seg_bounds.push((pos, pos + slen));
+            pos += slen;
+        }
+    }
+
+    // SoA flat arrays. Layout: seed_idx = seg_id * n_qs + (qid * 2 + strand)
+    // Seeds for the same segment are contiguous → each segment's loop touches
+    // only its own seeds.
+    let n_seeds = n_seg * n_qs;
+    let mut seed_l = vec![0u32; n_seeds];
+    let mut seed_r = vec![bwt_len; n_seeds];
+
+    // Process segment by segment — only touch this segment's contiguous block.
+    for seg_id in 0..n_seg {
+        let (seg_start, seg_end) = seg_bounds[seg_id];
+        let seg_len = seg_end - seg_start;
+        let seg_offset = seg_id * n_qs; // start of this segment's seeds
+
+        for depth in 0..seg_len {
+            let col = seg_end - 1 - depth; // BWT backward: right-to-left
+
+            // Process this segment's seeds in batches of 8 for AVX2.
+            let mut batch_start = 0;
+            while batch_start < n_qs {
+                let batch_end = (batch_start + 8).min(n_qs);
+                let batch_len = batch_end - batch_start;
+
+                // Collect (l-1, r) positions for rank computation.
+                let mut pos_l = [u32::MAX; 8];
+                let mut pos_r = [0u32; 8];
+                for k in 0..batch_len {
+                    let si = seg_offset + batch_start + k;
+                    let l = seed_l[si];
+                    let r = seed_r[si];
+                    pos_l[k] = if l > 0 { l - 1 } else { u32::MAX };
+                    pos_r[k] = if r > 0 { r - 1 } else { 0 }; // exclusive→inclusive for rank
+                }
+
+                // 16-wide interleaved rank.
+                let (ranks_l, ranks_r) = rank_16way_interleaved(blocks_ptr, pos_l, pos_r);
+
+                // Per-seed base selection and interval update.
+                for k in 0..batch_len {
+                    let si = seg_offset + batch_start + k;
+                    let l = seed_l[si];
+                    let r = seed_r[si];
+
+                    // Dead seed check: l >= r means empty interval.
+                    if l >= r {
+                        continue;
+                    }
+
+                    // Decode seed index → qid, strand.
+                    let qs_idx = batch_start + k; // = si - seg_offset
+                    let qid = qs_idx / 2;
+                    let strand = qs_idx % 2; // 0 = fwd, 1 = rc
+
+                    let c = if strand == 0 {
+                        queries_fwd[qid][col]
+                    } else {
+                        queries_rc[qid][col]
+                    };
+
+                    let bi = match c {
+                        b'A' => 0usize,
+                        b'C' => 1,
+                        b'G' => 2,
+                        b'T' => 3,
+                        _ => { seed_l[si] = bwt_len; seed_r[si] = 0; continue; }
+                    };
+
+                    let nl = less_arr[bi] + ranks_l[k][bi];
+                    let nr = less_arr[bi] + ranks_r[k][bi];
+
+                    if nl >= nr {
+                        seed_l[si] = bwt_len;
+                        seed_r[si] = 0;
+                    } else {
+                        seed_l[si] = nl;
+                        seed_r[si] = nr; // exclusive
+                    }
+                }
+
+                batch_start = batch_end;
+            }
+        }
+    }
+
+    // AVX2 existence check + sparse collection with width cap.
+    // Seeds wider than MAX_SEED_WIDTH are in repetitive regions and discarded.
+    const MAX_SEED_WIDTH: u32 = 128;
+
+    let mut surv_l = Vec::new();
+    let mut surv_r = Vec::new();
+    let mut surv_qid = Vec::new();
+    let mut surv_seg = Vec::new();
+    let mut surv_strand = Vec::new();
+
+    let mut batch_start = 0;
+    while batch_start < n_seeds {
+        let batch_end = (batch_start + 8).min(n_seeds);
+        let batch_len = batch_end - batch_start;
+
+        let mut l_buf = [0u32; 8];
+        let mut r_buf = [0u32; 8];
+        for k in 0..batch_len {
+            l_buf[k] = seed_l[batch_start + k];
+            r_buf[k] = seed_r[batch_start + k];
+        }
+
+        let l_v = _mm256_loadu_si256(l_buf.as_ptr() as *const __m256i);
+        let r_v = _mm256_loadu_si256(r_buf.as_ptr() as *const __m256i);
+        let alive_v = _mm256_cmpgt_epi32(
+            _mm256_xor_si256(r_v, _mm256_set1_epi32(i32::MIN)),
+            _mm256_xor_si256(l_v, _mm256_set1_epi32(i32::MIN)),
+        );
+        let mask = _mm256_movemask_ps(_mm256_castsi256_ps(alive_v)) as u32;
+
+        let mut m = mask & ((1u32 << batch_len) - 1);
+        while m != 0 {
+            let bit = m.trailing_zeros() as usize;
+            let si = batch_start + bit;
+            let l = seed_l[si];
+            let r = seed_r[si];
+            let width = r - l;
+
+            // Width cap: discard seeds in repetitive regions.
+            if width <= MAX_SEED_WIDTH {
+                let seg_id = si / n_qs;
+                let qs_idx = si % n_qs;
+                let qid = qs_idx / 2;
+                let strand = (qs_idx % 2) as u8;
+
+                surv_l.push(l);
+                surv_r.push(r);
+                surv_qid.push(qid as u32);
+                surv_seg.push(seg_id as u32);
+                surv_strand.push(strand);
+            }
+
+            m &= m - 1;
+        }
+
+        batch_start = batch_end;
+    }
+
+    (surv_l, surv_r, surv_qid, surv_seg, surv_strand)
+}
+
+/// SIMD Hamming distance for queries ≤ 32 bytes.
+///
+/// Compares `query[0..query_len]` against `genome[0..query_len]` using a single
+/// AVX2 compare + popcount. Returns the number of mismatches.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn simd_hamming_le32(query: &[u8], genome: &[u8], query_len: usize) -> u32 {
+    use std::arch::x86_64::*;
+
+    let mut q_buf = [0u8; 32];
+    let mut g_buf = [0u8; 32];
+    q_buf[..query_len].copy_from_slice(&query[..query_len]);
+    g_buf[..query_len].copy_from_slice(&genome[..query_len]);
+
+    let q_v = _mm256_loadu_si256(q_buf.as_ptr() as *const __m256i);
+    let g_v = _mm256_loadu_si256(g_buf.as_ptr() as *const __m256i);
+    let eq_v = _mm256_cmpeq_epi8(q_v, g_v);
+    let eq_bits = _mm256_movemask_epi8(eq_v) as u32;
+
+    let valid = if query_len >= 32 { u32::MAX } else { (1u32 << query_len) - 1 };
+    let matches = (eq_bits & valid).count_ones();
+    query_len as u32 - matches
+}
+
+/// Hamming distance for queries of any length, with early exit.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn simd_hamming(query: &[u8], genome: &[u8], query_len: usize, max_mm: u8) -> u32 {
+    if query_len <= 32 {
+        return simd_hamming_le32(query, genome, query_len);
+    }
+    // Process in 32-byte chunks with early exit.
+    let mut total_mm = 0u32;
+    let mut offset = 0;
+    while offset < query_len {
+        let chunk = (query_len - offset).min(32);
+        let mm = simd_hamming_le32(&query[offset..], &genome[offset..], chunk);
+        total_mm += mm;
+        if total_mm > max_mm as u32 {
+            return total_mm;
+        }
+        offset += 32;
+    }
+    total_mm
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1425,280 +1900,180 @@ pub fn step_depth_dedup<I: FmOcc>(
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Verify-from-Leading-Seeds (Pigeonhole Supplement)
+//  Wavefront Processor — block-address sorted linear streaming + 8-wide AVX2 rank
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Verify pass: search the LEADING K-mer of each query with up to `seed_mm`
-/// mismatches using the PosTable, then verify the full query against the
-/// stored genome text character-by-character.
+/// Drop-in replacement for `step_depth_dedup` using the wavefront strategy:
 ///
-/// This supplements the BWT extension pass (which seeds from the TRAILING K-mer).
-/// Together they satisfy the pigeonhole principle: for max_mm=k mismatches across
-/// 2 non-overlapping segments, at least one segment has ≤ floor(k/2) mismatches.
+/// 1. **Sort by block_idx(l-1)** — memory access sweeps linearly through the
+///    RankBlock array so the hardware prefetcher pulls data into L1 automatically.
+/// 2. **Detect groups of identical (l,r)** — work-item sharing is preserved.
+/// 3. **Batch 8 groups' rank computations** via `rank_8way_avx2` — two gather
+///    batches (l-1 positions, then r positions) amortise latency across 8 groups.
+/// 4. Per-group: existing `vertical_automaton_avx2` + `dispatch_survivors`.
+/// 5. `dedup_frontier` on next (unchanged).
 ///
-/// Parallelized with rayon: queries are processed in chunks across threads.
-fn verify_leading_seeds(
-    genome_text: &[u8],
-    pos_table: &PosTable,
+/// Requires AVX2 and `rank_blocks() → Some`. Falls back to `step_depth_dedup`
+/// at the call site when unavailable.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn step_depth_wavefront<I: FmOcc>(
+    index: &I,
+    frontier: &SearchFrontier,
+    depth: usize,
+    query_len: usize,
     queries_fwd: &[Vec<u8>],
     queries_rc: &[Vec<u8>],
-    query_len: usize,
     max_mm: u8,
     chroms: &ChromGeometry,
     hits: &mut HitAccumulator,
+    next: &mut SearchFrontier,
+    lineage: &mut LineageTable,
+    clog_vqids: &mut Vec<u32>,
+    ws: &mut StepWorkspace,
 ) {
-    use rayon::prelude::*;
+    use std::arch::x86_64::*;
 
-    let k = pos_table.k();
-    // Dynamic seed_mm based on K vs query_len overlap:
-    //   Non-overlapping (2K ≤ L): seed_mm=1 suffices by pigeonhole
-    //   Overlapping (2K > L):     seed_mm=2 needed for coverage
-    let seed_mm = if k * 2 <= query_len { max_mm.min(1) } else { max_mm.min(2) };
-    let text_len = genome_text.len();
-    let n_queries = queries_fwd.len();
+    let n = frontier.len();
+    if n == 0 {
+        return;
+    }
+    next.clear();
 
-    // Process queries in parallel; each thread collects (qid, pos, strand, score).
-    let chunk_results: Vec<Vec<(u32, u32, bool, f32)>> = (0..n_queries)
-        .into_par_iter()
-        .map(|qid| {
-            let mut local_hits: Vec<(u32, u32, bool, f32)> = Vec::new();
-            let mut variants: Vec<(usize, u8)> = Vec::with_capacity(64);
+    let (blocks, less_tbl) = index.rank_blocks().unwrap();
+    let blocks_ptr = blocks.as_ptr() as *const i32;
 
-            // Forward strand: leading K-mer = query_fwd[0..K]
-            let fwd_leading = &queries_fwd[qid][0..k];
-            variants.clear();
-            kmer_index::enumerate_kmer_variants(fwd_leading, seed_mm, &mut variants);
-            for &(rank, _mm_used) in &variants {
-                for &gpos in pos_table.positions_for_rank(rank) {
-                    let start = gpos as usize;
-                    if start + query_len > text_len { continue; }
-                    if !chroms.is_valid(start, query_len) { continue; }
+    let col = query_len - 1 - depth;
+    let is_terminal = depth + 1 == query_len;
+    let seqs: [&[Vec<u8>]; 2] = [queries_fwd, queries_rc];
 
-                    let genome = &genome_text[start..start + query_len];
-                    let query = &queries_fwd[qid];
-                    let mut mm = 0u8;
-                    let mut ok = true;
-                    for j in 0..query_len {
-                        if genome[j] != query[j] {
-                            mm += 1;
-                            if mm > max_mm { ok = false; break; }
-                        }
-                    }
-                    if ok {
-                        local_hits.push((qid as u32, start as u32, true, SCORE_LUT[mm as usize]));
-                    }
-                }
-            }
+    // Precompute less values for the 4 bases (A, C, G, T).
+    let less_arr: [u32; 4] = [
+        less_tbl[b'A' as usize] as u32,
+        less_tbl[b'C' as usize] as u32,
+        less_tbl[b'G' as usize] as u32,
+        less_tbl[b'T' as usize] as u32,
+    ];
 
-            // Reverse complement strand: leading K-mer = query_rc[0..K]
-            let rc_leading = &queries_rc[qid][0..k];
-            variants.clear();
-            kmer_index::enumerate_kmer_variants(rc_leading, seed_mm, &mut variants);
-            for &(rank, _mm_used) in &variants {
-                for &gpos in pos_table.positions_for_rank(rank) {
-                    let start = gpos as usize;
-                    if start + query_len > text_len { continue; }
-                    if !chroms.is_valid(start, query_len) { continue; }
+    // ── Sort frontier by block_idx(l-1) for linear streaming ────────────
+    let mut order = std::mem::take(&mut ws.order);
+    order.clear();
+    order.extend(0..n as u32);
+    order.sort_unstable_by(|&a, &b| {
+        let (a, b) = (a as usize, b as usize);
+        let blk_a = if frontier.l[a] > 0 { (frontier.l[a] - 1) >> 6 } else { u32::MAX };
+        let blk_b = if frontier.l[b] > 0 { (frontier.l[b] - 1) >> 6 } else { u32::MAX };
+        blk_a.cmp(&blk_b)
+            .then(frontier.l[a].cmp(&frontier.l[b]))
+            .then(frontier.r[a].cmp(&frontier.r[b]))
+    });
 
-                    let genome = &genome_text[start..start + query_len];
-                    let query = &queries_rc[qid];
-                    let mut mm = 0u8;
-                    let mut ok = true;
-                    for j in 0..query_len {
-                        if genome[j] != query[j] {
-                            mm += 1;
-                            if mm > max_mm { ok = false; break; }
-                        }
-                    }
-                    if ok {
-                        local_hits.push((qid as u32, start as u32, false, SCORE_LUT[mm as usize]));
-                    }
-                }
-            }
-
-            local_hits
-        })
-        .collect();
-
-    // Merge all thread-local results into the accumulator.
-    for local in chunk_results {
-        for (qi, pos, strand, score) in local {
-            hits.push(qi, pos, strand, score);
+    // ── Detect groups of identical (l, r) ───────────────────────────────
+    let mut group_starts = std::mem::take(&mut ws.group_starts);
+    group_starts.clear();
+    group_starts.push(0);
+    for i in 1..n {
+        let prev = order[i - 1] as usize;
+        let curr = order[i] as usize;
+        if frontier.l[curr] != frontier.l[prev] || frontier.r[curr] != frontier.r[prev] {
+            group_starts.push(i);
         }
     }
-}
+    let n_groups = group_starts.len();
 
-/// Targeted verify for clog-affected queries only: uses seed_mm = max_mm to search
-/// the leading K-mer with all possible mismatches. Only called for the small subset
-/// of queries that had clog-pruned BWT paths.
-fn verify_leading_seeds_targeted(
-    genome_text: &[u8],
-    pos_table: &PosTable,
-    queries_fwd: &[Vec<u8>],
-    queries_rc: &[Vec<u8>],
-    clog_qids: &[u32],
-    query_len: usize,
-    max_mm: u8,
-    chroms: &ChromGeometry,
-    hits: &mut HitAccumulator,
-) {
-    use rayon::prelude::*;
+    // Reusable buffers.
+    let mut work_items: Vec<WorkItem> = Vec::new();
+    let mut bkt: [Vec<u32>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut base_survivors: [Vec<(u32, u8, u8)>; 4] =
+        [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
 
-    let k = pos_table.k();
-    let seed_mm = max_mm; // full mismatch budget for clog recovery
-    let text_len = genome_text.len();
+    // ── Process groups in batches of 8 ──────────────────────────────────
+    let mut g = 0usize;
+    while g < n_groups {
+        let batch_end = (g + 8).min(n_groups);
+        let batch_len = batch_end - g;
 
-    let chunk_results: Vec<Vec<(u32, u32, bool, f32)>> = clog_qids
-        .par_iter()
-        .map(|&qid| {
-            let qid = qid as usize;
-            let mut local_hits: Vec<(u32, u32, bool, f32)> = Vec::new();
-            let mut variants: Vec<(usize, u8)> = Vec::with_capacity(4096);
-
-            // Forward strand
-            let fwd_leading = &queries_fwd[qid][0..k];
-            variants.clear();
-            kmer_index::enumerate_kmer_variants(fwd_leading, seed_mm, &mut variants);
-            for &(rank, _) in &variants {
-                for &gpos in pos_table.positions_for_rank(rank) {
-                    let start = gpos as usize;
-                    if start + query_len > text_len { continue; }
-                    if !chroms.is_valid(start, query_len) { continue; }
-                    let genome = &genome_text[start..start + query_len];
-                    let query = &queries_fwd[qid];
-                    let mut mm = 0u8;
-                    let mut ok = true;
-                    for j in 0..query_len {
-                        if genome[j] != query[j] {
-                            mm += 1;
-                            if mm > max_mm { ok = false; break; }
-                        }
-                    }
-                    if ok {
-                        local_hits.push((qid as u32, start as u32, true, SCORE_LUT[mm as usize]));
-                    }
-                }
-            }
-
-            // Reverse complement strand
-            let rc_leading = &queries_rc[qid][0..k];
-            variants.clear();
-            kmer_index::enumerate_kmer_variants(rc_leading, seed_mm, &mut variants);
-            for &(rank, _) in &variants {
-                for &gpos in pos_table.positions_for_rank(rank) {
-                    let start = gpos as usize;
-                    if start + query_len > text_len { continue; }
-                    if !chroms.is_valid(start, query_len) { continue; }
-                    let genome = &genome_text[start..start + query_len];
-                    let query = &queries_rc[qid];
-                    let mut mm = 0u8;
-                    let mut ok = true;
-                    for j in 0..query_len {
-                        if genome[j] != query[j] {
-                            mm += 1;
-                            if mm > max_mm { ok = false; break; }
-                        }
-                    }
-                    if ok {
-                        local_hits.push((qid as u32, start as u32, false, SCORE_LUT[mm as usize]));
-                    }
-                }
-            }
-
-            local_hits
-        })
-        .collect();
-
-    for local in chunk_results {
-        for (qi, pos, strand, score) in local {
-            hits.push(qi, pos, strand, score);
+        // Collect l-1 and r positions for rank_8way.
+        let mut pos_l = [u32::MAX; 8]; // u32::MAX = sentinel for l=0
+        let mut pos_r = [0u32; 8];
+        for k in 0..batch_len {
+            let gi = group_starts[g + k];
+            let idx = order[gi] as usize;
+            let l = frontier.l[idx];
+            let r = frontier.r[idx];
+            pos_l[k] = if l > 0 { l - 1 } else { u32::MAX };
+            pos_r[k] = r;
         }
+        // Pad unused lanes with safe values (will be ignored).
+        for k in batch_len..8 {
+            pos_l[k] = u32::MAX;
+            pos_r[k] = 0;
+        }
+
+        // 16-wide interleaved rank computation — overlaps l/r gather latency.
+        let (ranks_l, ranks_r) = rank_16way_interleaved(blocks_ptr, pos_l, pos_r);
+
+        // Process each group in this batch.
+        for k in 0..batch_len {
+            let group_idx = g + k;
+            let gi = group_starts[group_idx];
+            let gj = if group_idx + 1 < n_groups { group_starts[group_idx + 1] } else { n };
+            let first = order[gi] as usize;
+            let _l = frontier.l[first] as usize;
+            let _r = frontier.r[first] as usize;
+
+            // Compute nl[4] and nr[4] from precomputed ranks + less table.
+            let mut nl_arr = [0u32; 4];
+            let mut nr_arr = [0u32; 4];
+            for bi in 0..4 {
+                nl_arr[bi] = less_arr[bi] + ranks_l[k][bi];
+                nr_arr[bi] = less_arr[bi] + ranks_r[k][bi];
+            }
+
+            // alive: nl < nr_exc (non-empty child intervals)
+            let nl_v = _mm_loadu_si128(nl_arr.as_ptr() as *const __m128i);
+            let nr_v = _mm_loadu_si128(nr_arr.as_ptr() as *const __m128i);
+            let alive_v = _mm_cmpgt_epi32(nr_v, nl_v);
+            let alive_mask = _mm_movemask_ps(_mm_castsi128_ps(alive_v));
+            if alive_mask == 0 { continue; }
+
+            // Build work_items from lineage.
+            work_items.clear();
+            for gk in gi..gj {
+                let idx = order[gk] as usize;
+                let budget = frontier.budget[idx];
+                let lin_id = frontier.query_id[idx];
+                for &vqid in lineage.get(lin_id) {
+                    let target_char =
+                        seqs[(vqid & 1) as usize][(vqid >> 1) as usize][col];
+                    work_items.push(WorkItem { vqid, budget, target_char });
+                }
+            }
+
+            // Vertical SIMD Automaton.
+            for buf in base_survivors.iter_mut() { buf.clear(); }
+            vertical_automaton_avx2(
+                &work_items, alive_mask,
+                &mut base_survivors,
+            );
+
+            // Dispatch survivors.
+            dispatch_survivors(
+                &base_survivors, &nl_arr, &nr_arr, is_terminal,
+                query_len, max_mm, index, chroms, hits, next, lineage,
+                &mut bkt, clog_vqids,
+            );
+        }
+
+        g = batch_end;
     }
-}
 
-/// Verify pass for TRAILING K-mer: complements the BWT pass (which seeds trailing
-/// K-mer with 0mm only). Enumerates trailing K-mer variants with up to `seed_mm`
-/// mismatches, looks up positions in PosTable, verifies full query against genome.
-///
-/// The alignment start = genome_trailing_pos - (query_len - K).
-fn verify_trailing_seeds(
-    genome_text: &[u8],
-    pos_table: &PosTable,
-    queries_fwd: &[Vec<u8>],
-    queries_rc: &[Vec<u8>],
-    query_len: usize,
-    max_mm: u8,
-    chroms: &ChromGeometry,
-    hits: &mut HitAccumulator,
-) {
-    let k = pos_table.k();
-    // Dynamic seed_mm based on K vs query_len overlap:
-    //   Non-overlapping (2K ≤ L): seed_mm=1 suffices by pigeonhole
-    //   Overlapping (2K > L):     seed_mm=2 needed for coverage
-    let seed_mm = if k * 2 <= query_len { max_mm.min(1) } else { max_mm.min(2) };
-    let text_len = genome_text.len();
-    let prefix_len = query_len - k; // offset from alignment start to trailing K-mer
-
-    let mut variants: Vec<(usize, u8)> = Vec::with_capacity(64);
-
-    for qid in 0..queries_fwd.len() {
-        // Forward strand: trailing K-mer = query_fwd[query_len-K..]
-        let fwd_trailing = &queries_fwd[qid][prefix_len..];
-        variants.clear();
-        kmer_index::enumerate_kmer_variants(fwd_trailing, seed_mm, &mut variants);
-        for &(rank, _mm_used) in &variants {
-            for &gpos in pos_table.positions_for_rank(rank) {
-                let kmer_start = gpos as usize;
-                // Alignment starts at kmer_start - prefix_len
-                if kmer_start < prefix_len { continue; }
-                let start = kmer_start - prefix_len;
-                if start + query_len > text_len { continue; }
-                if !chroms.is_valid(start, query_len) { continue; }
-
-                let genome = &genome_text[start..start + query_len];
-                let query = &queries_fwd[qid];
-                let mut mm = 0u8;
-                let mut ok = true;
-                for j in 0..query_len {
-                    if genome[j] != query[j] {
-                        mm += 1;
-                        if mm > max_mm { ok = false; break; }
-                    }
-                }
-                if ok {
-                    hits.push(qid as u32, start as u32, true, SCORE_LUT[mm as usize]);
-                }
-            }
-        }
-
-        // Reverse complement strand: trailing K-mer = query_rc[query_len-K..]
-        let rc_trailing = &queries_rc[qid][prefix_len..];
-        variants.clear();
-        kmer_index::enumerate_kmer_variants(rc_trailing, seed_mm, &mut variants);
-        for &(rank, _mm_used) in &variants {
-            for &gpos in pos_table.positions_for_rank(rank) {
-                let kmer_start = gpos as usize;
-                if kmer_start < prefix_len { continue; }
-                let start = kmer_start - prefix_len;
-                if start + query_len > text_len { continue; }
-                if !chroms.is_valid(start, query_len) { continue; }
-
-                let genome = &genome_text[start..start + query_len];
-                let query = &queries_rc[qid];
-                let mut mm = 0u8;
-                let mut ok = true;
-                for j in 0..query_len {
-                    if genome[j] != query[j] {
-                        mm += 1;
-                        if mm > max_mm { ok = false; break; }
-                    }
-                }
-                if ok {
-                    hits.push(qid as u32, start as u32, false, SCORE_LUT[mm as usize]);
-                }
-            }
-        }
+    if !is_terminal && next.len() > 1 {
+        dedup_frontier(next, lineage);
     }
+
+    ws.order = order;
+    ws.group_starts = group_starts;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1757,300 +2132,29 @@ fn dedup_hits(hits: &mut HitAccumulator) {
 //  Driver: width-first search with k-mer seeding + mmap frontier
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Threshold: if initial frontier exceeds this, use mmap-backed frontiers.
-const MMAP_THRESHOLD: usize = 500_000;
-
-/// Width-first search with on-disk k-mer seeding.
+/// Width-first BWT search with tunable mismatch-branch width cap.
 ///
-/// 1. Load (or build) the 10-mer seed table.
-/// 2. For each query × strand, generate mismatch neighborhood seeds at depth K.
-/// 3. If frontier is small, run in-memory. If large, use mmap ping/pong.
-/// 4. Step depths K..query_len with branchless 4-way expansion.
+/// Expands the full query length through the BWT. Mismatch branches whose
+/// interval width exceeds `max_width` are pruned — these correspond to
+/// repetitive genomic regions that are biologically uninformative.
+/// Exact-match branches are never pruned regardless of width.
 pub fn search_width_first_seeded<I: FmOcc>(
     index: &I,
-    seed_table: &KmerSeedTable,
-    pos_table: &PosTable,
-    genome_text: &[u8],
-    queries_fwd: &[Vec<u8>],
-    queries_rc: &[Vec<u8>],
-    query_len: usize,
-    max_mm: u8,
-    chroms: &ChromGeometry,
-    hits: &mut HitAccumulator,
-) -> io::Result<()> {
-    debug_assert_eq!(queries_fwd.len(), queries_rc.len());
-    debug_assert!(max_mm <= 3);
-
-    let k = seed_table.k();
-
-    if query_len <= k {
-        // Query is shorter than seed length — fall back to direct table lookup.
-        return search_short_queries(index, seed_table, queries_fwd, queries_rc,
-                                     query_len, max_mm, chroms, hits);
-    }
-
-    // ── Phase 0: BWT extension from trailing seed ──────────────────────
-    // Seeds the trailing K-mer with up to `seed_mm` mismatches, then gives
-    // the remaining budget to width-first BWT extension through the leading
-    // positions. This covers all alignments where mm_trailing ≤ seed_mm.
-    //
-    // The verify pass (Phase 1) covers mm_leading ≤ seed_mm via PosTable,
-    // which together with this phase satisfies the pigeonhole principle:
-    // for max_mm mismatches across 2 segments, at least one has ≤ floor(max_mm/2).
-
-    // Dynamic seed_mm based on K vs query_len overlap:
-    //   Non-overlapping (2K ≤ L): seed_mm=1 suffices by pigeonhole
-    //   Overlapping (2K > L):     seed_mm=2 needed for coverage
-    let seed_mm = if k * 2 <= query_len { max_mm.min(1) } else { max_mm.min(2) };
-    let n_queries = queries_fwd.len();
-    let mut seed_l = Vec::new();
-    let mut seed_r = Vec::new();
-    let mut seed_bud = Vec::new();
-    let mut seed_qid = Vec::new();
-    let mut seed_str = Vec::new();
-
-    let mut seed_buf: Vec<KmerSeed> = Vec::with_capacity(64);
-
-    for qid in 0..n_queries {
-        // Forward strand: trailing K-mer = query[query_len-K..]
-        let fwd_kmer = &queries_fwd[qid][query_len - k..];
-        seed_buf.clear();
-        kmer_index::seed_with_mismatches(seed_table, fwd_kmer, seed_mm, &mut seed_buf);
-        for s in &seed_buf {
-            seed_l.push(s.l);
-            seed_r.push(s.r);
-            seed_bud.push(max_mm - s.mm_used); // remaining budget for extension
-            seed_qid.push(qid as u32);
-            seed_str.push(1u8);
-        }
-
-        // Reverse complement strand: trailing K-mer = rc_query[query_len-K..]
-        let rc_kmer = &queries_rc[qid][query_len - k..];
-        seed_buf.clear();
-        kmer_index::seed_with_mismatches(seed_table, rc_kmer, seed_mm, &mut seed_buf);
-        for s in &seed_buf {
-            seed_l.push(s.l);
-            seed_r.push(s.r);
-            seed_bud.push(max_mm - s.mm_used); // remaining budget for extension
-            seed_qid.push(qid as u32);
-            seed_str.push(0u8);
-        }
-    }
-
-    let initial_size = seed_l.len();
-    let remaining_depths = query_len - k; // depths K..query_len-1
-
-    if remaining_depths == 0 {
-        // K == query_len: seeds are terminal — resolve SA positions directly.
-        for i in 0..initial_size {
-            let mm_used = max_mm - seed_bud[i];
-            let score = SCORE_LUT[mm_used as usize];
-            let fwd = seed_str[i] != 0;
-            let lo = seed_l[i] as usize;
-            let hi = seed_r[i] as usize + 1;
-            for sa_idx in lo..hi {
-                let sa_pos = index.sa(sa_idx);
-                if chroms.is_valid(sa_pos, query_len) {
-                    hits.push(seed_qid[i], sa_pos as u32, fwd, score);
-                }
-            }
-        }
-        return Ok(());
-    }
-
-    // ── Dispatch: dedup vs simple in-memory ─────────────────────────────
-    // Dedup pays for itself when there are enough seeds to share intervals.
-    // At 0mm with small batches, the overhead of sort-merge isn't worth it.
-    let use_dedup = initial_size > 1000 || max_mm > 0;
-
-    let clog_vqids = if use_dedup {
-        search_dedup_from_seeds(
-            index, &seed_l, &seed_r, &seed_bud, &seed_qid, &seed_str,
-            k, queries_fwd, queries_rc, query_len, max_mm, chroms, hits,
-        )
-    } else {
-        search_inmemory_from_seeds(
-            index, &seed_l, &seed_r, &seed_bud, &seed_qid, &seed_str,
-            k, queries_fwd, queries_rc, query_len, max_mm, chroms, hits,
-        );
-        Vec::new()
-    };
-
-    // ── Phase 1: Verify-from-leading-seeds (pigeonhole supplement) ─────
-    // BWT Phase 0 covers mm_T ≤ seed_mm (trailing K-mer seeded with mismatches).
-    // Leading verify covers mm_L ≤ seed_mm (leading K-mer searched via PosTable).
-    // By pigeonhole: for any alignment with max_mm mismatches across 2 segments,
-    // at least one segment has ≤ floor(max_mm/2) ≤ seed_mm. Combined coverage
-    // is complete.
-    //
-    // Additionally, for queries clog-pruned during BWT (mm_L > seed_mm in clogged
-    // intervals), we run a targeted verify with seed_mm = max_mm to recover those hits.
-    if max_mm >= 1 {
-        verify_leading_seeds(
-            genome_text, pos_table,
-            queries_fwd, queries_rc,
-            query_len, max_mm, chroms, hits,
-        );
-
-        // Targeted verify for clog-affected queries: recover hits with mm_L > seed_mm
-        // that the BWT pass pruned in wide intervals.
-        if !clog_vqids.is_empty() && max_mm >= 2 {
-            // Deduplicate clog-affected query IDs.
-            let mut clog_qids: Vec<u32> = clog_vqids.iter().map(|v| v >> 1).collect();
-            clog_qids.sort_unstable();
-            clog_qids.dedup();
-
-            verify_leading_seeds_targeted(
-                genome_text, pos_table,
-                queries_fwd, queries_rc,
-                &clog_qids,
-                query_len, max_mm, chroms, hits,
-            );
-        }
-
-        dedup_hits(hits);
-    }
-
-    Ok(())
-}
-
-/// In-memory path for small frontiers without dedup (< DEDUP_THRESHOLD rows, 0mm).
-fn search_inmemory_from_seeds<I: FmOcc>(
-    index: &I,
-    sl: &[u32], sr: &[u32], sb: &[u8], sq: &[u32], ss: &[u8],
-    start_depth: usize,
-    queries_fwd: &[Vec<u8>],
-    queries_rc: &[Vec<u8>],
-    query_len: usize,
-    max_mm: u8,
-    chroms: &ChromGeometry,
-    hits: &mut HitAccumulator,
-) {
-    let n = sl.len();
-    let mut a = SearchFrontier::with_capacity(n);
-    for i in 0..n {
-        a.push(sl[i], sr[i], sb[i], sq[i], ss[i]);
-    }
-    let mut b = SearchFrontier::with_capacity(n * 2);
-    let mut ws = StepWorkspace::new();
-
-    for depth in start_depth..query_len {
-        step_depth(
-            index, &a, depth, query_len, queries_fwd, queries_rc,
-            max_mm, chroms, hits, &mut b, &mut ws,
-        );
-        std::mem::swap(&mut a, &mut b);
-    }
-}
-
-/// Deduplicated in-memory path: lineage table + sort-merge after each depth.
-/// Returns the set of vqids that were clog-pruned during BWT extension.
-fn search_dedup_from_seeds<I: FmOcc>(
-    index: &I,
-    sl: &[u32], sr: &[u32], sb: &[u8], sq: &[u32], ss: &[u8],
-    start_depth: usize,
-    queries_fwd: &[Vec<u8>],
-    queries_rc: &[Vec<u8>],
-    query_len: usize,
-    max_mm: u8,
-    chroms: &ChromGeometry,
-    hits: &mut HitAccumulator,
-) -> Vec<u32> {
-    let n = sl.len();
-    let mut lineage = LineageTable::with_capacity(n * 2, n);
-
-    // Seed initial lineages: each seed gets a singleton lineage.
-    // vqid = query_id * 2 + strand_bit (0=fwd, 1=rc)
-    let mut a = SearchFrontier::with_capacity(n);
-    for i in 0..n {
-        let vqid = sq[i] * 2 + (1 - ss[i] as u32);
-        let lin_id = lineage.alloc(&[vqid]);
-        a.push(sl[i], sr[i], sb[i], lin_id, 0);
-    }
-
-    // Dedup the initial seed frontier.
-    dedup_frontier(&mut a, &mut lineage);
-
-    let mut b = SearchFrontier::with_capacity(a.len() * 2);
-    let mut clog_vqids: Vec<u32> = Vec::new();
-    let mut ws = StepWorkspace::new();
-
-    for depth in start_depth..query_len {
-        step_depth_dedup(
-            index, &a, depth, query_len, queries_fwd, queries_rc,
-            max_mm, chroms, hits, &mut b, &mut lineage, &mut clog_vqids,
-            &mut ws,
-        );
-        std::mem::swap(&mut a, &mut b);
-    }
-
-    clog_vqids
-}
-
-/// Mmap path for large frontiers (>= MMAP_THRESHOLD rows).
-fn search_mmap_from_seeds<I: FmOcc>(
-    index: &I,
-    sl: &[u32], sr: &[u32], sb: &[u8], sq: &[u32], ss: &[u8],
-    start_depth: usize,
-    queries_fwd: &[Vec<u8>],
-    queries_rc: &[Vec<u8>],
-    query_len: usize,
-    max_mm: u8,
-    chroms: &ChromGeometry,
-    hits: &mut HitAccumulator,
-) -> io::Result<()> {
-    // Write seeds into the first mmap frontier.
-    let mut writer_a = MmapFrontier::new()?;
-    for i in 0..sl.len() {
-        writer_a.push(sl[i], sr[i], sb[i], sq[i], ss[i])?;
-    }
-
-    let mut writer_b = MmapFrontier::new()?;
-
-    for depth in start_depth..query_len {
-        // Freeze the current writer into a read-only snapshot.
-        let frozen = writer_a.freeze()?;
-
-        // Reset the other writer for this depth's output.
-        writer_b.reset()?;
-
-        step_depth_mmap(
-            index, &frozen, depth, query_len, queries_fwd, queries_rc,
-            max_mm, chroms, hits, &mut writer_b,
-        )?;
-
-        // Ping/pong: swap writers. writer_a (now drained) becomes the next output.
-        std::mem::swap(&mut writer_a, &mut writer_b);
-    }
-
-    Ok(())
-}
-
-/// Handle queries shorter than or equal to SEED_K.
-fn search_short_queries<I: FmOcc>(
-    index: &I,
     _seed_table: &KmerSeedTable,
+    _pos_table: &PosTable,
+    _genome_text: &[u8],
     queries_fwd: &[Vec<u8>],
     queries_rc: &[Vec<u8>],
     query_len: usize,
     max_mm: u8,
+    max_width: u32,
     chroms: &ChromGeometry,
     hits: &mut HitAccumulator,
 ) -> io::Result<()> {
-    // For short queries, we can't use the K-mer table directly since it's
-    // built for K-length strings. Fall back to the original depth-0 seeding.
-    let sa_len = index.sa_len() as u32;
-    let mut a = SearchFrontier::seed(queries_fwd.len(), sa_len, max_mm);
-    let mut b = SearchFrontier::with_capacity(a.len() * 2);
-    let mut ws = StepWorkspace::new();
-
-    for depth in 0..query_len {
-        step_depth(
-            index, &a, depth, query_len, queries_fwd, queries_rc,
-            max_mm, chroms, hits, &mut b, &mut ws,
-        );
-        std::mem::swap(&mut a, &mut b);
-    }
+    search_width_first(
+        index, queries_fwd, queries_rc, query_len,
+        max_mm, max_width, chroms, hits,
+    );
     Ok(())
 }
 
@@ -2064,6 +2168,7 @@ pub fn search_width_first<I: FmOcc>(
     queries_rc: &[Vec<u8>],
     query_len: usize,
     max_mm: u8,
+    max_width: u32,
     chroms: &ChromGeometry,
     hits: &mut HitAccumulator,
 ) {
@@ -2078,7 +2183,7 @@ pub fn search_width_first<I: FmOcc>(
     for depth in 0..query_len {
         step_depth(
             index, &a, depth, query_len, queries_fwd, queries_rc,
-            max_mm, chroms, hits, &mut b, &mut ws,
+            max_mm, max_width, chroms, hits, &mut b, &mut ws,
         );
         std::mem::swap(&mut a, &mut b);
     }

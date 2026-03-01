@@ -219,83 +219,6 @@ impl KmerSeedTable {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  Mismatch neighborhood seeding
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// A seed: BWT interval at depth K with mismatch cost already incurred.
-#[derive(Clone, Copy)]
-pub struct KmerSeed {
-    pub l: u32,
-    pub r: u32,
-    /// Mismatches consumed by the k-mer prefix variations.
-    pub mm_used: u8,
-}
-
-/// Generate all valid seeds for a query's trailing K-mer, allowing up to
-/// `max_mm` mismatches within the K-mer itself.
-///
-/// The trailing K-mer is `query[query_len - K ..]` (the suffix consumed first
-/// by backward search). We enumerate all base substitution combinations up to
-/// `max_mm` mismatches, look each up in the seed table, and collect non-absent
-/// results.
-///
-/// For K=10, max_mm=3: at most C(10,0) + C(10,1)*3 + C(10,2)*9 + C(10,3)*27
-/// = 1 + 30 + 270 + 3240 = 3541 lookups (each is a single array dereference).
-pub fn seed_with_mismatches(
-    table: &KmerSeedTable,
-    kmer: &[u8],
-    max_mm: u8,
-    out: &mut Vec<KmerSeed>,
-) {
-    debug_assert_eq!(kmer.len(), table.k());
-    let k = table.k();
-
-    // Stack-based enumeration: (position, current_rank, mm_so_far).
-    // We build the rank incrementally left-to-right (MSB first).
-    struct Frame {
-        pos: usize,
-        rank: usize,
-        mm: u8,
-    }
-
-    let mut stack = Vec::with_capacity(4096);
-    stack.push(Frame { pos: 0, rank: 0, mm: 0 });
-
-    while let Some(Frame { pos, rank, mm }) = stack.pop() {
-        if pos == k {
-            // Complete k-mer: look up in table.
-            if let Some((l, r)) = table.lookup_rank(rank) {
-                out.push(KmerSeed { l, r, mm_used: mm });
-            }
-            continue;
-        }
-
-        let orig_base = kmer[pos];
-        for &sub_rank in &[0u8, 1, 2, 3] {
-            let sub_base = rank_to_base(sub_rank);
-            let cost = if sub_base == orig_base { 0u8 } else { 1 };
-            let new_mm = mm + cost;
-
-            // Prune: can't exceed budget even if all remaining positions match.
-            if new_mm > max_mm {
-                continue;
-            }
-
-            // Even stronger prune: if we've already used all mismatches,
-            // only the exact base is viable for remaining positions.
-            // (Handled naturally by the budget check above, but this comment
-            // documents the pruning property.)
-
-            stack.push(Frame {
-                pos: pos + 1,
-                rank: (rank << 2) | sub_rank as usize,
-                mm: new_mm,
-            });
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
 //  Position Table — maps k-mer rank → sorted genome positions (no SA needed)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -363,54 +286,6 @@ impl PosTable {
     #[inline]
     pub fn k(&self) -> usize {
         self.k
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  K-mer mismatch variant enumeration (by rank, for PosTable)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/// Enumerate all k-mer variants with up to `max_mm` mismatches.
-/// Outputs `(rank, mm_used)` pairs into `out`.
-///
-/// Same combinatorial enumeration as `seed_with_mismatches`, but produces
-/// k-mer ranks (for PosTable lookup) instead of BWT intervals.
-pub fn enumerate_kmer_variants(
-    kmer: &[u8],
-    max_mm: u8,
-    out: &mut Vec<(usize, u8)>,
-) {
-    let k = kmer.len();
-
-    struct Frame {
-        pos: usize,
-        rank: usize,
-        mm: u8,
-    }
-
-    let mut stack = Vec::with_capacity(if max_mm == 0 { 16 } else { 4096 });
-    stack.push(Frame { pos: 0, rank: 0, mm: 0 });
-
-    while let Some(Frame { pos, rank, mm }) = stack.pop() {
-        if pos == k {
-            out.push((rank, mm));
-            continue;
-        }
-
-        let orig_base = kmer[pos];
-        for &sub_rank in &[0u8, 1, 2, 3] {
-            let sub_base = rank_to_base(sub_rank);
-            let cost = if sub_base == orig_base { 0u8 } else { 1 };
-            let new_mm = mm + cost;
-            if new_mm > max_mm {
-                continue;
-            }
-            stack.push(Frame {
-                pos: pos + 1,
-                rank: (rank << 2) | sub_rank as usize,
-                mm: new_mm,
-            });
-        }
     }
 }
 

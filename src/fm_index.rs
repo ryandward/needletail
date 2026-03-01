@@ -245,6 +245,14 @@ impl BlockRank {
         self.bwt_len
     }
 
+    /// Base pointer for AVX2 gather instructions.
+    /// Each `RankBlock` is 16 × i32 = 64 bytes. Gather index for field `f`
+    /// in block `b` is `b * 16 + f`.
+    #[inline]
+    pub fn blocks_i32_ptr(&self) -> *const i32 {
+        self.blocks.as_ptr() as *const i32
+    }
+
     /// Convert blocks back to flat interleaved format for serialization.
     /// Returns `data[pos * 4 + base_idx]` = count of base in `BWT[0..=pos]`.
     /// O(N) — only used during index persistence, never on the hot path.
