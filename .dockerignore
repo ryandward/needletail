@@ -18,9 +18,9 @@ __pycache__/
 *.json
 !Cargo.lock
 
-# Python bindings (not needed for server image)
+# Python bindings source (keep Cargo.toml for workspace resolution)
 python/
-crates/needletail-py/
+crates/needletail-py/src/
 
 # Editor and IDE
 .idea/

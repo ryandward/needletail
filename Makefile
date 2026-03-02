@@ -6,7 +6,7 @@ PORT    ?= 8002
 
 ## Build the Docker image, pruning dangling images left by previous builds
 docker:
-	docker build -t $(IMAGE):$(TAG) .
+	DOCKER_BUILDKIT=1 docker build -t $(IMAGE):$(TAG) .
 	@echo "── pruning dangling images ──"
 	docker image prune -f
 
