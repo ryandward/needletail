@@ -304,11 +304,25 @@ pub fn load_fasta(path: &Path, circular_chroms: Option<&[&str]>) -> Result<Genom
     for record in reader.records() {
         let record = record
             .map_err(|e| format!("Failed to parse FASTA record: {}", e))?;
-        let chrom = record.id().to_string();
+        // Strip version suffix (e.g., "NC_001133.9" → "NC_001133")
+        let raw_id = record.id();
+        let chrom = match raw_id.rfind('.') {
+            Some(dot) if raw_id[dot + 1..].bytes().all(|b| b.is_ascii_digit()) => {
+                raw_id[..dot].to_string()
+            }
+            _ => raw_id.to_string(),
+        };
         let seq: Vec<u8> = record.seq().iter().map(|b| b.to_ascii_uppercase()).collect();
 
-        let is_circular = circular_chroms
-            .map_or(false, |circs| circs.contains(&chrom.as_str()));
+        let is_circular = circular_chroms.map_or(false, |circs| {
+            circs.iter().any(|c| {
+                let stripped = match c.rfind('.') {
+                    Some(dot) if c[dot + 1..].bytes().all(|b| b.is_ascii_digit()) => &c[..dot],
+                    _ => c,
+                };
+                stripped == chrom
+            })
+        });
         let topology = if is_circular {
             Topology::Circular
         } else {

@@ -101,7 +101,6 @@ pub fn design_library(
 
     let genes: Vec<Region> = genome.genes().into_iter().cloned().collect();
     let chrom_sizes = genome.chrom_length_map();
-
     // ── Step: scanning ──────────────────────────────────────────────────────
     progress.set_step("scanning");
     progress.set_stage("Tiling genome features");

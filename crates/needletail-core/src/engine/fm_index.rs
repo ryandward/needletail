@@ -367,8 +367,18 @@ impl FmIndexSearcher {
 
             let seq_up: Vec<u8> = seq.iter().map(|&b| b.to_ascii_uppercase()).collect();
 
+            // Strip version suffix (e.g., "NC_001133.9" → "NC_001133")
+            // to match GenBank accession format used by genome features.
+            let raw_id = record.id();
+            let name = match raw_id.rfind('.') {
+                Some(dot) if raw_id[dot + 1..].bytes().all(|b| b.is_ascii_digit()) => {
+                    raw_id[..dot].to_string()
+                }
+                _ => raw_id.to_string(),
+            };
+
             chroms.push(ChromInfo {
-                name: record.id().to_string(),
+                name,
                 start,
                 len: seq_up.len(),
             });
