@@ -195,6 +195,47 @@ G=0100, T=1000, N=1111, etc.). At each hit position, the engine checks
 regex overhead. Both forward and reverse-complement PAMs are checked via
 precomputed mask arrays.
 
+### Branchless Algorithms
+
+A branch misprediction on a modern CPU costs 15–20 cycles.  In hot loops
+that touch every position in a 12 million base genome, that adds up fast.
+Needletail eliminates branches at every layer of the stack:
+
+**BlockRank — `popcnt` instead of table lookups.**  Each 64-byte rank block
+stores per-base bitvectors.  A rank query masks the bitvector with
+`(2u64 << offset) - 1` and calls `count_ones()` — a single `POPCNT`
+instruction.  No conditional branches, no lookup tables, no cache misses
+beyond the one cache line fetch.
+
+**Complement table — `COMPLEMENT[b]` instead of if/else.**  DNA complement
+(`A↔T`, `C↔G`) uses a 256-byte static lookup table.  One indexed load per
+base, zero branches.  Same pattern for `BASE_MASK[b]` in PAM validation:
+each genome byte maps to a 4-bit IUPAC mask via table lookup, then a single
+`&` tests the match.
+
+**IUPAC mask complement — bit rotation instead of conditionals.**
+`complement_mask()` swaps A↔T (bits 0↔3) and C↔G (bits 1↔2) with four
+shift-and-mask operations.  No branches, no lookup table — just bitwise
+arithmetic on a `u8`.
+
+**Coordinate algebra — `rem_euclid` instead of boundary checks.**  Circular
+chromosome wrapping uses modular arithmetic everywhere: `(pos).rem_euclid(len)`
+handles origin-spanning coordinates without if/else boundary branches.
+Linear mode skips the modulo entirely.  The `geometry.rs` module is
+documented as "zero branches" — every function is a mathematical operation,
+never a conditional tree.
+
+**Vertical automaton — SIMD bitwise recurrence.**  The mismatch budget
+in the AVX2 search is tracked as 4 bitmask registers `R_0..R_3`, updated
+via AND/OR/ANDN operations.  The entire match/mismatch/prune decision is
+a bitwise recurrence — no per-item `if` statements, no scalar comparisons.
+256 work items are pruned simultaneously with `_mm256_testz_si256`.
+
+**Inclusive mask — overflow-safe shift.**  `((2u64 << offset) - 1) as u32`
+generates a bitmask with bits 0 through `offset` set, using 64-bit
+intermediate arithmetic to avoid overflow when `offset = 31`.  One
+expression, no branch on the boundary case.
+
 ### Seed Tables: Two-Tier Acceleration
 
 K-mer seed tables pre-index the genome at K=10 (8 MiB, for mm ≤ 2) and K=14
