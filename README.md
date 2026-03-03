@@ -122,9 +122,11 @@ src/
 │   ├── kmer_index.rs   K=10 / K=14 seed tables, PosTable
 │   └── simd_search.rs  AVX2 vertical automaton, width-first BFS
 │
-├── io/                 Disk boundary
-│   ├── persist.rs      rkyv zero-copy serialization, mmap
-│   └── parquet_sink.rs Arrow zero-copy Parquet export
+├── io/                    Disk boundary
+│   ├── persist.rs         rkyv zero-copy serialization, mmap
+│   ├── parquet_hits.rs    Arrow zero-copy HitAccumulator export
+│   ├── parquet_regions.rs RegionSink → Parquet (columnar output)
+│   └── json.rs            RegionSink → JSON (streaming output)
 │
 ├── operations/         Hot loops (composition layer)
 │   └── pam_scanner.rs  PAM site scanning, guide enrichment,

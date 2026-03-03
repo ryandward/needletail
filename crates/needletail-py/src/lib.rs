@@ -320,7 +320,7 @@ impl FmIndex {
         };
 
         let chroms_geo = self.inner.chrom_geometry();
-        let n_rows = needletail_core::io::parquet_sink::hits_to_parquet(&acc, &chroms_geo, &out_path)
+        let n_rows = needletail_core::io::parquet_hits::hits_to_parquet(&acc, &chroms_geo, &out_path)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         Ok(n_rows)

@@ -35,7 +35,7 @@ fn compute_pool() -> &'static rayon::ThreadPool {
     })
 }
 
-use needletail_core::io::parquet_file_sink::ParquetFileSink;
+use needletail_core::io::parquet_regions::ParquetFileSink;
 use needletail_core::models::preset::{CRISPRPreset, FeatureConfig};
 use needletail_core::pipeline::design::{self, LibraryResult, ProgressSink};
 

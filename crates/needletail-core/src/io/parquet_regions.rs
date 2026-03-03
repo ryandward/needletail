@@ -6,10 +6,10 @@
 //! Schema is discovered dynamically from the first row group: the fixed
 //! Region fields (chrom, start, end, strand, score) are always present,
 //! and every tag seen across the buffered regions becomes a nullable column.
-//! Columns are ordered by `KNOWN_ORDER` first, then alphabetically for any
-//! tags the pipeline didn't exist when this file was written.
+//! Columns are ordered by `TAG_ORDER` first, then alphabetically for any
+//! novel tags.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,24 +21,9 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use crate::models::region::{Region, TagValue};
-use super::RegionSink;
+use super::{RegionSink, HIDDEN_TAGS, TAG_ORDER};
 
 const ROW_GROUP_SIZE: usize = 100_000;
-
-// Tags that are internal pipeline state — never exported.
-const HIDDEN_TAGS: &[&str] = &["landmark", "gene_strand"];
-
-// Preferred column order for known tags.  Tags listed here appear in this
-// sequence after the five fixed fields; any tags NOT listed here follow in
-// alphabetical order.  This keeps output stable across pipeline versions
-// while remaining open to new tags without code changes.
-const KNOWN_ORDER: &[&str] = &[
-    "guide_id", "guide_seq", "spacer", "pam_seq",
-    "off_targets", "total_hits",
-    "feature_type", "feature_name", "feature_strand",
-    "feature_start", "feature_end",
-    "signed_distance", "relative_pos", "offset", "overlap",
-];
 
 // ─── Arrow type for a TagValue ───────────────────────────────────────────────
 
@@ -131,6 +116,10 @@ pub struct ParquetFileSink {
     schema: Option<Arc<Schema>>,
     /// Ordered tag columns: (tag_name, ColType).  Set on first flush.
     tag_cols: Vec<(String, ColType)>,
+    /// O(1) lookup for schema-miss detection after first flush.
+    tag_col_names: HashSet<String>,
+    /// Tags we've already warned about (only warn once per tag name).
+    warned_tags: HashSet<String>,
 }
 
 impl ParquetFileSink {
@@ -151,6 +140,8 @@ impl ParquetFileSink {
             writer: None,
             schema: None,
             tag_cols: Vec::new(),
+            tag_col_names: HashSet::new(),
+            warned_tags: HashSet::new(),
         })
     }
 
@@ -169,9 +160,9 @@ impl ParquetFileSink {
             }
         }
 
-        // Order: KNOWN_ORDER tags first (if present), then remaining sorted.
+        // Order: TAG_ORDER tags first (if present), then remaining sorted.
         let mut ordered: Vec<(String, ColType)> = Vec::with_capacity(seen.len());
-        for &name in KNOWN_ORDER {
+        for &name in TAG_ORDER {
             if let Some(ct) = seen.remove(name) {
                 ordered.push((name.to_string(), ct));
             }
@@ -193,6 +184,7 @@ impl ParquetFileSink {
         }
 
         self.schema = Some(Arc::new(Schema::new(fields)));
+        self.tag_col_names = ordered.iter().map(|(n, _)| n.clone()).collect();
         self.tag_cols = ordered;
     }
 
@@ -246,6 +238,19 @@ impl ParquetFileSink {
 
             for (i, (name, _)) in self.tag_cols.iter().enumerate() {
                 tag_builders[i].append_tag(region.tags.get(name));
+            }
+
+            // Warn once per novel tag that appeared after schema was locked.
+            for k in region.tags.keys() {
+                if !HIDDEN_TAGS.contains(&k.as_str())
+                    && !self.tag_col_names.contains(k)
+                    && self.warned_tags.insert(k.clone())
+                {
+                    eprintln!(
+                        "[parquet] warning: tag '{}' not in schema (first seen after row group 1), column omitted",
+                        k
+                    );
+                }
             }
         }
 
@@ -361,11 +366,11 @@ mod tests {
         assert_eq!(schema.field(3).name(), "strand");
         assert_eq!(schema.field(4).name(), "score");
 
-        // Dynamic tag columns discovered — KNOWN_ORDER tags first
+        // Dynamic tag columns discovered — TAG_ORDER tags first
         let tag_names: Vec<&str> = (5..schema.fields().len())
             .map(|i| schema.field(i).name().as_str())
             .collect();
-        // guide_id should come before feature_type per KNOWN_ORDER
+        // guide_id should come before feature_type per TAG_ORDER
         let gid_pos = tag_names.iter().position(|&n| n == "guide_id").unwrap();
         let ft_pos  = tag_names.iter().position(|&n| n == "feature_type").unwrap();
         assert!(gid_pos < ft_pos);
@@ -475,7 +480,7 @@ mod tests {
         let cl = schema.field_with_name("custom_label").unwrap();
         assert_eq!(cl.data_type(), &DataType::Utf8);
 
-        // guide_id (KNOWN_ORDER) should come before gc_content/custom_label
+        // guide_id (TAG_ORDER) should come before gc_content/custom_label
         let gid_idx = schema.index_of("guide_id").unwrap();
         let gc_idx  = schema.index_of("gc_content").unwrap();
         let cl_idx  = schema.index_of("custom_label").unwrap();

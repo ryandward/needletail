@@ -70,7 +70,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `src/geometry.rs` — pure 1D math (leaf, no deps)
   - `src/chemistry.rs` — molecular rules (leaf, no deps)
   - `src/engine/` — `fm_index.rs`, `kmer_index.rs`, `simd_search.rs`
-  - `src/io/` — `persist.rs`, `parquet_sink.rs`
+  - `src/io/` — `persist.rs`, `parquet_hits.rs`, `parquet_regions.rs`, `json.rs`
   - `src/operations/` — `pam_scanner.rs`
   - `src/lib.rs` — orchestration & FFI only
 - `search_batch` signature extended with `max_width`, `pam`,

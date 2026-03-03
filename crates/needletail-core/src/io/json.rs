@@ -13,24 +13,27 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use crate::models::region::{Region, TagValue};
-use super::RegionSink;
+use super::{RegionSink, HIDDEN_TAGS};
+#[cfg(test)]
+use super::TAG_ORDER;
 
-// Fields that are internal pipeline state — never exposed in output.
-const HIDDEN_TAGS: &[&str] = &["landmark", "gene_strand"];
-
-// Canonical output field order. Fields are emitted in this sequence;
-// any tag not listed here comes after, in iteration order.
+// Full field order for JSON output: fixed Region fields interleaved with
+// TAG_ORDER so that `score` appears after guide identity and before
+// off-target quality, matching the user's semantic grouping.
+//
+// The tag entries here must stay consistent with TAG_ORDER in io/mod.rs —
+// the `test_field_order_covers_tag_order` test enforces this.
 const FIELD_ORDER: &[&str] = &[
-    // position
+    // position (fixed)
     "chrom", "start", "end", "strand",
-    // guide identity
+    // guide identity (from TAG_ORDER)
     "guide_id", "guide_seq", "spacer", "pam_seq",
-    // off-target quality
+    // off-target quality (score is fixed; off_targets/total_hits from TAG_ORDER)
     "score", "off_targets", "total_hits",
-    // feature context
+    // feature context (from TAG_ORDER)
     "feature_type", "feature_name", "feature_strand",
     "feature_start", "feature_end",
-    // positional within feature
+    // positional within feature (from TAG_ORDER)
     "signed_distance", "relative_pos", "offset", "overlap",
 ];
 
@@ -214,6 +217,19 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0]["chrom"], "chr1");
         assert_eq!(parsed[1]["chrom"], "chr1");
+    }
+
+    #[test]
+    fn test_field_order_covers_tag_order() {
+        // Every entry in TAG_ORDER must appear in FIELD_ORDER.
+        // This catches drift between the shared constant and the JSON-specific ordering.
+        for &tag in TAG_ORDER {
+            assert!(
+                FIELD_ORDER.contains(&tag),
+                "TAG_ORDER entry '{}' missing from FIELD_ORDER — add it to json.rs",
+                tag,
+            );
+        }
     }
 
     #[test]
