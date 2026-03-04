@@ -3,7 +3,7 @@ use std::sync::Arc;
 use needletail_core::engine::fm_index::ChromInfo;
 use needletail_core::io::genbank::load_genbank;
 use needletail_core::io::json::FileSink;
-use needletail_core::models::preset::{CRISPRPreset, FeatureConfig};
+use needletail_core::models::preset::{CRISPRPreset, FeatureConfig, NamingConfig};
 use needletail_core::pipeline::design_crispr_library::{design_crispr_library, NullProgress};
 use needletail_core::{FmIndexSearcher, IndexHandle, build_seed_tiers};
 
@@ -12,7 +12,8 @@ fn main() {
         .unwrap_or_else(|| "test/fixtures/zymomonas.gb".to_string());
 
     let t0 = std::time::Instant::now();
-    let mut genome = load_genbank(Path::new(&gb_path)).unwrap();
+    let naming = NamingConfig::default_config();
+    let mut genome = load_genbank(Path::new(&gb_path), &naming.name_priority).unwrap();
     eprintln!("Loaded genome: {} chroms, {} genes ({:.2?})",
         genome.chromosomes.len(), genome.genes().len(), t0.elapsed());
 

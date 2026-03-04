@@ -13,7 +13,11 @@ use crate::models::genome::{Genome, Topology};
 use crate::models::region::{Region, Strand, TagValue};
 
 /// Load a GenBank file (`.gb` or `.gb.gz`) into a `Genome`.
-pub fn load_genbank(path: &Path) -> Result<Genome, String> {
+///
+/// `name_priority` is an ordered list of qualifier keys; the first one
+/// present on each feature record becomes `Region.name`.  Pass
+/// `&NamingConfig::default_config().name_priority` for the standard priority.
+pub fn load_genbank(path: &Path, name_priority: &[String]) -> Result<Genome, String> {
     if !path.exists() {
         return Err(format!("Genome file not found: {}", path.display()));
     }
@@ -55,7 +59,7 @@ pub fn load_genbank(path: &Path) -> Result<Genome, String> {
                 continue;
             }
 
-            let regions = extract_feature(feature, &chrom, seq_len, topology.is_circular());
+            let regions = extract_feature(feature, &chrom, seq_len, topology.is_circular(), name_priority);
             genome.features.extend(regions);
         }
     }
@@ -86,27 +90,34 @@ fn parse_genbank_file(path: &Path) -> Result<Vec<gb_io::seq::Seq>, String> {
 /// Handles simple locations, complement (reverse strand), and compound
 /// locations (join). Origin-wrapping genes on circular chromosomes get
 /// virtual coordinates beyond `seq_len`.
+///
+/// `name_priority` controls which qualifier becomes `Region.name`: the first
+/// key present in the record wins.  No biological string is hardcoded here.
 fn extract_feature(
     feature: &gb_io::seq::Feature,
     chrom: &str,
     seq_len: usize,
     circular: bool,
+    name_priority: &[String],
 ) -> Vec<Region> {
     let feature_type = feature.kind.to_string();
 
-    // Extract qualifiers
-    let locus_tag = get_qualifier(feature, "locus_tag");
-    let gene_name = get_qualifier(feature, "gene");
-    let product = get_qualifier(feature, "product");
+    // Collect all qualifiers (first value wins per key).
+    let mut quals: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for (qk, qv) in &feature.qualifiers {
+        if let Some(v) = qv {
+            quals.entry(qk.to_string()).or_insert_with(|| v.to_string());
+        }
+    }
 
-    // Determine display name: prefer locus_tag, then gene
-    let name = locus_tag
-        .as_deref()
-        .or(gene_name.as_deref())
-        .unwrap_or("")
-        .to_string();
+    // Resolve display name: walk priority list, take first non-empty match.
+    let name = name_priority
+        .iter()
+        .find_map(|key| quals.get(key).filter(|v| !v.is_empty()))
+        .cloned()
+        .unwrap_or_default();
 
-    // Parse location → (start, end, strand, parts, wraps_origin)
+    // Parse location → (start, end, strand, wraps_origin)
     let parsed = parse_location(&feature.location, seq_len, circular);
 
     parsed
@@ -117,14 +128,10 @@ fn extract_feature(
                 .with_name(name.clone())
                 .with_tag("feature_type", feature_type.clone());
 
-            if let Some(ref lt) = locus_tag {
-                region.tags.insert("locus_tag".into(), TagValue::Str(lt.clone()));
-            }
-            if let Some(ref gn) = gene_name {
-                region.tags.insert("gene".into(), TagValue::Str(gn.clone()));
-            }
-            if let Some(ref pr) = product {
-                region.tags.insert("product".into(), TagValue::Str(pr.clone()));
+            // Store all qualifiers as tags for downstream annotators.
+            // (locus_tag, gene, product are copied by locus.rs into guide records.)
+            for (k, v) in &quals {
+                region.tags.insert(k.clone(), TagValue::Str(v.clone()));
             }
             if loc.wraps_origin {
                 region.tags.insert("wraps_origin".into(), TagValue::Bool(true));
@@ -133,16 +140,6 @@ fn extract_feature(
             region
         })
         .collect()
-}
-
-/// Get the first value for a qualifier key.
-fn get_qualifier(feature: &gb_io::seq::Feature, key: &str) -> Option<String> {
-    for (qk, qv) in &feature.qualifiers {
-        if qk.as_ref() == key {
-            return qv.as_ref().map(|v| v.to_string());
-        }
-    }
-    None
 }
 
 /// Parsed location result.
@@ -359,7 +356,8 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let genome = load_genbank(&path).unwrap();
+        let naming = crate::models::preset::NamingConfig::default_config();
+        let genome = load_genbank(&path, &naming.name_priority).unwrap();
 
         // Two records: synth_chrom (circular) + synth_plasmid (linear)
         assert_eq!(genome.chromosomes.len(), 2);
@@ -380,32 +378,33 @@ mod tests {
         assert_eq!(genes.len(), 4);
 
         // geneA: gene 10..30 → 0-based [9, 30)
+        // name_priority: "gene" wins over "locus_tag" → Region.name = "geneA"
+        // locus_tag is still available as a tag
         let gene_a = genome
             .features
             .iter()
-            .find(|r| r.name == "SCH_0001" && r.tags.get("feature_type").and_then(|v| v.as_str()) == Some("gene"))
+            .find(|r| r.name == "geneA" && r.tags.get("feature_type").and_then(|v| v.as_str()) == Some("gene"))
             .unwrap();
         assert_eq!(gene_a.start, 9);
         assert_eq!(gene_a.end, 30);
         assert_eq!(gene_a.strand, Strand::Forward);
+        assert_eq!(gene_a.tags.get("locus_tag").and_then(|v| v.as_str()), Some("SCH_0001"));
 
         // geneB: complement(50..70) → 0-based [49, 70), reverse
         let gene_b = genome
             .features
             .iter()
-            .find(|r| r.name == "SCH_0002")
+            .find(|r| r.name == "geneB")
             .unwrap();
         assert_eq!(gene_b.start, 49);
         assert_eq!(gene_b.end, 70);
         assert_eq!(gene_b.strand, Strand::Reverse);
 
         // geneC: join(90..100,1..15) on circular → wraps origin
-        // 90..100 = [89, 100), 1..15 = [0, 15)
-        // real_start = 89, span = 11 + 15 = 26, end = 115
         let gene_c = genome
             .features
             .iter()
-            .find(|r| r.name == "SCH_0003")
+            .find(|r| r.name == "geneC")
             .unwrap();
         assert_eq!(gene_c.start, 89);
         assert_eq!(gene_c.end, 115);
@@ -419,7 +418,7 @@ mod tests {
         let gene_d = genome
             .features
             .iter()
-            .find(|r| r.name == "SCP_0001")
+            .find(|r| r.name == "geneD")
             .unwrap();
         assert_eq!(gene_d.start, 9);
         assert_eq!(gene_d.end, 40);
@@ -432,7 +431,8 @@ mod tests {
         if !path.exists() {
             return;
         }
-        let genome = load_genbank(&path).unwrap();
+        let naming = crate::models::preset::NamingConfig::default_config();
+        let genome = load_genbank(&path, &naming.name_priority).unwrap();
         assert_eq!(genome.chromosomes.len(), 2);
         assert_eq!(genome.features.len(), 5); // 4 genes + 1 CDS
     }

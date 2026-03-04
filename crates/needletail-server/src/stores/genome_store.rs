@@ -9,6 +9,7 @@ use uuid::Uuid;
 use needletail_core::engine::fm_index::ChromInfo;
 use needletail_core::io::genbank::{load_fasta, load_genbank};
 use needletail_core::models::genome::Genome;
+use needletail_core::models::preset::NamingConfig;
 use needletail_core::{FmIndexSearcher, IndexHandle, SeedTier};
 
 /// A stored genome with its FM-Index and seed tiers.
@@ -70,8 +71,9 @@ impl GenomeStore {
         let is_genbank = matches!(ext, "gb" | "gbk" | "gbff" | "genbank")
             || file_path.ends_with(".gb.gz");
         let is_fasta = matches!(ext, "fa" | "fasta" | "fna" | "fas");
+        let naming = NamingConfig::default_config();
         let mut genome = if is_genbank {
-            load_genbank(path)?
+            load_genbank(path, &naming.name_priority)?
         } else if is_fasta {
             load_fasta(path, None)?
         } else {

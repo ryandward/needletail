@@ -79,7 +79,7 @@ pub fn annotate_features(
             if let Some(def) = overlap_def {
                 let mut body = Region::new(chrom, gene.start, gene.end)
                     .with_strand(gene.strand)
-                    .with_name(&def.name)
+                    .with_name(gene.name.as_str())
                     .with_tag("feature_type", def.name.clone());
 
                 try_enrich(&mut body, gene, def);
@@ -259,7 +259,7 @@ fn emit_gap_region(
     let def = &features[*def_idx];
 
     let mut region = Region::new(chrom, start, end)
-        .with_name(&def.name)
+        .with_name(gene.name.as_str())
         .with_tag("feature_type", def.name.clone())
         .with_strand(gene.strand);
 

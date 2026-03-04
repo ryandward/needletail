@@ -52,6 +52,36 @@ impl Anchor {
 }
 
 // ---------------------------------------------------------------------------
+// NamingConfig — universal entity name resolution priority
+// ---------------------------------------------------------------------------
+
+static NAMING_YAML: &str = include_str!("../../../../presets/naming.yaml");
+
+/// Priority list for resolving a feature's display name from its attributes.
+///
+/// Organism and format independent.  The first attribute present on a feature
+/// record becomes `Region.name`.  Loaded from `presets/naming.yaml` — the
+/// single source of truth for biological naming conventions.
+#[derive(Debug, Clone)]
+pub struct NamingConfig {
+    pub name_priority: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct NamingYaml {
+    name_priority: Vec<String>,
+}
+
+impl NamingConfig {
+    /// Load the embedded universal naming configuration.
+    pub fn default_config() -> Self {
+        let y: NamingYaml = serde_yaml::from_str(NAMING_YAML)
+            .expect("presets/naming.yaml is embedded and must be valid");
+        NamingConfig { name_priority: y.name_priority }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CRISPRPreset — loaded from YAML
 // ---------------------------------------------------------------------------
 

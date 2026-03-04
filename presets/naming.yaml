@@ -1,0 +1,18 @@
+# Universal attribute name priority for biological entity identity resolution.
+#
+# Organism and format independent — applies to GenBank, GFF3, and any future parser.
+# The first attribute present on a feature record becomes Region.name.
+#
+# Precedence rationale:
+#   gene/Name/standard_name — human-curated common names (most useful to biologists)
+#   locus_tag               — systematic stable identifier (fallback when no common name)
+#   product                 — functional description (last resort for anonymous ORFs)
+#   ID                      — GFF3 record identifier (lowest priority structural fallback)
+
+name_priority:
+  - gene
+  - locus_tag
+  - Name
+  - standard_name
+  - product
+  - ID
