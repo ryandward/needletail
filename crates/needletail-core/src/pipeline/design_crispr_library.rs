@@ -398,6 +398,7 @@ fn build_guide_region(
     Region::new(&chrom_names[cid], gs, ge)
         .with_strand(strand)
         .with_name(&guide_id)
+        .with_score(off_targets as f64)
         .with_tag("spacer",      spacer)
         .with_tag("pam_seq",     pam_seq)
         .with_tag("off_targets", off_targets as i64)
