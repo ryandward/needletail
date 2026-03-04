@@ -70,9 +70,6 @@ impl JobStatus {
 /// - `step_stage`: free-text sublabel within the current step
 /// - `items_complete`/`items_total`: discrete n-of-x counter
 pub struct JobProgress {
-    pub stage: std::sync::Mutex<String>,
-    pub current: AtomicUsize,
-    pub total: AtomicUsize,
     pub cancelled: AtomicBool,
     /// Current UI step key (e.g., "scanning", "scoring").
     pub step: std::sync::Mutex<Option<String>>,
@@ -85,12 +82,6 @@ pub struct JobProgress {
 }
 
 impl ProgressSink for JobProgress {
-    fn report(&self, stage: &str, current: usize, total: usize) {
-        *self.stage.lock().unwrap() = stage.to_string();
-        self.current.store(current, Ordering::Release);
-        self.total.store(total, Ordering::Release);
-    }
-
     fn set_step(&self, step: &str) {
         *self.step.lock().unwrap() = Some(step.to_string());
         // Reset stage and items on step change
@@ -180,9 +171,6 @@ impl JobManager {
     ) -> String {
         let job_id = Uuid::new_v4().simple().to_string()[..12].to_string();
         let progress = Arc::new(JobProgress {
-            stage: std::sync::Mutex::new("queued".into()),
-            current: AtomicUsize::new(0),
-            total: AtomicUsize::new(0),
             cancelled: AtomicBool::new(false),
             step: std::sync::Mutex::new(None),
             step_stage: std::sync::Mutex::new(None),
@@ -270,24 +258,47 @@ impl JobManager {
                 .as_millis() as u64;
             job.finished_at.store(end_ms, Ordering::Release);
 
-            match &result {
-                Ok(ref lib) => {
-                    job.guides_complete
-                        .store(lib.guides_written, Ordering::Release);
-                    job.chroms_complete
-                        .store(job.chroms_total.load(Ordering::Acquire), Ordering::Release);
-                    *job.status.lock().unwrap() = JobStatus::Complete;
-                    *job.result_path.lock().unwrap() = Some(file_path);
-                }
-                Err(e) => {
-                    if e == "cancelled" {
-                        *job.status.lock().unwrap() = JobStatus::Cancelled;
-                    } else {
-                        *job.status.lock().unwrap() = JobStatus::Failed;
-                        *job.error.lock().unwrap() = Some(e.clone());
+            // ── Terminal state commit ────────────────────────────────────
+            // The status Mutex is the single authority.  We read the
+            // cancellation flag *inside* the lock so that an external
+            // cancel() that arrived between the last is_cancelled() check
+            // and now is respected.  Terminal states are monotonic:
+            // once Cancelled or Failed, nothing can overwrite to Complete.
+            {
+                let mut status = job.status.lock().unwrap();
+                match &result {
+                    Ok(ref lib) => {
+                        job.guides_complete
+                            .store(lib.guides_written, Ordering::Release);
+                        job.chroms_complete
+                            .store(job.chroms_total.load(Ordering::Acquire), Ordering::Release);
+
+                        if progress.cancelled.load(Ordering::Acquire)
+                            || *status == JobStatus::Cancelled
+                        {
+                            // Cancel arrived after the pipeline finished
+                            // but before we committed.  Honour it.
+                            *status = JobStatus::Cancelled;
+                            // Clean up the completed file — nobody will fetch it.
+                            std::fs::remove_file(&file_path).ok();
+                        } else {
+                            *status = JobStatus::Complete;
+                            *job.result_path.lock().unwrap() = Some(file_path);
+                        }
+                    }
+                    Err(e) => {
+                        if e == "cancelled"
+                            || progress.cancelled.load(Ordering::Acquire)
+                            || *status == JobStatus::Cancelled
+                        {
+                            *status = JobStatus::Cancelled;
+                        } else {
+                            *status = JobStatus::Failed;
+                            *job.error.lock().unwrap() = Some(e.clone());
+                        }
                     }
                 }
-            }
+            } // status Mutex dropped
 
             *job.result.lock().unwrap() = Some(result);
         });
@@ -300,14 +311,27 @@ impl JobManager {
         self.jobs.get(id).map(|v| v.clone())
     }
 
-    /// Cancel a job. Best-effort: always returns true if the job exists.
+    /// Cancel a job.
+    ///
+    /// Sets the atomic cancellation flag.  The worker thread is the sole
+    /// writer of terminal states — it checks this flag under the status
+    /// Mutex before committing Complete, ensuring monotonic transitions.
+    ///
+    /// For jobs still Queued (not yet picked up by a worker), we also
+    /// commit Cancelled directly since no worker thread will ever run.
     pub fn cancel(&self, id: &str) -> bool {
         if let Some(job) = self.jobs.get(id) {
-            let status = *job.status.lock().unwrap();
-            if status == JobStatus::Queued || status == JobStatus::Running {
-                job.progress.cancelled.store(true, Ordering::Release);
-                *job.status.lock().unwrap() = JobStatus::Cancelled;
+            // Signal cancellation to the pipeline's is_cancelled() checks.
+            job.progress.cancelled.store(true, Ordering::Release);
+
+            // If the job hasn't started yet, commit the terminal state
+            // ourselves — no worker thread exists to observe the flag.
+            let mut status = job.status.lock().unwrap();
+            if *status == JobStatus::Queued {
+                *status = JobStatus::Cancelled;
             }
+            // Running jobs: the worker thread will observe the flag
+            // and commit Cancelled itself.  We do NOT write here.
             true
         } else {
             false

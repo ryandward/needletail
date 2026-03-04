@@ -35,8 +35,6 @@ pub async fn status(
     let status = *job.status.lock().unwrap();
     let elapsed = job.elapsed_secs();
 
-    let guides_complete = job.guides_complete.load(Ordering::Acquire);
-
     // Read step/stage/items from progress
     let step = job.progress.step.lock().unwrap().clone();
     let stage = job.progress.step_stage.lock().unwrap().clone();
@@ -57,8 +55,11 @@ pub async fn status(
         None
     };
 
-    let rate: Option<f64> = match (elapsed, guides_complete) {
-        (Some(e), gc) if e > 0.0 && gc > 0 => Some((gc as f64 / e * 10.0).round() / 10.0),
+    // rate_per_sec: live throughput derived from the items counter.
+    // This is the actual processing rate of whichever step is currently
+    // running set_items() — scoring chunks or annotation drain.
+    let rate: Option<f64> = match (elapsed, items_complete) {
+        (Some(e), ic) if e > 0.0 && ic > 0 => Some((ic as f64 / e * 10.0).round() / 10.0),
         _ => None,
     };
 
@@ -83,11 +84,16 @@ pub async fn status(
     Ok(Json(resp))
 }
 
-/// Stream the completed job result.
+/// Stream the completed job result (one-shot).
 ///
 /// Called once by GenomeHub after status reaches "complete".
-/// Streams the result file directly from disk — zero RAM.
-/// Deletes the file and evicts the job after streaming.
+/// Streams the Parquet file directly from disk via an open fd.
+///
+/// **Lifecycle**: open fd → unlink path → stream from orphaned inode →
+/// fd drops → OS reclaims disk blocks.  No timers, no heuristics.
+///
+/// This endpoint is **consumed on read**: the first successful call
+/// takes ownership of the result.  Subsequent calls return 410 Gone.
 pub async fn stream(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -107,13 +113,13 @@ pub async fn stream(
         ));
     }
 
-    // Take the result path — file on disk written by ParquetFileSink.
+    // Take the result path — one-shot: first caller wins.
     let result_path = job.result_path.lock().unwrap().take();
     let taken_result = job.result.lock().unwrap().take();
 
     match (result_path, taken_result) {
         (Some(path), Some(Ok(_lib_result))) => {
-            // Open the file for async streaming
+            // Open the file descriptor FIRST — we need the fd before unlinking.
             let file = tokio::fs::File::open(&path).await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -121,21 +127,19 @@ pub async fn stream(
                 )
             })?;
 
+            // Unlink the directory entry immediately.  The VFS keeps the
+            // inode alive as long as our open fd exists.  When the
+            // ReaderStream drops (response complete or client disconnect),
+            // the fd closes and the OS reclaims the disk blocks.
+            // No timers.  No races.  Pure VFS reference counting.
+            tokio::fs::remove_file(&path).await.ok();
+
             let stream = ReaderStream::new(file);
             let body = Body::from_stream(stream);
 
             // Evict the job from the store.
             drop(job);
             state.jobs.remove(&id);
-
-            // Schedule file cleanup after response is sent.
-            // The file stays on disk until the stream completes.
-            let cleanup_path = path.clone();
-            tokio::spawn(async move {
-                // Give the response time to finish streaming
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                tokio::fs::remove_file(&cleanup_path).await.ok();
-            });
 
             let mut response = Response::new(body);
             response.headers_mut().insert(
@@ -148,9 +152,11 @@ pub async fn stream(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e })),
         )),
+        // Result already consumed by a prior /stream call, or
+        // never materialized (cancelled before completion).
         _ => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "result already consumed or not available" })),
+            StatusCode::GONE,
+            Json(json!({ "error": "Result already consumed or never produced. This endpoint is one-shot: the stream is consumed upon first read." })),
         )),
     }
 }

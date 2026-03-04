@@ -56,8 +56,6 @@ use crate::{
 ///
 /// `pct_complete` is per-step: it resets when step changes.
 pub trait ProgressSink: Send + Sync {
-    fn report(&self, stage: &str, current: usize, total: usize);
-
     /// Set the current UI step key (e.g., "scanning", "scoring").
     fn set_step(&self, _step: &str) {}
 
@@ -75,9 +73,7 @@ pub trait ProgressSink: Send + Sync {
 
 /// Null progress sink — does nothing.
 pub struct NullProgress;
-impl ProgressSink for NullProgress {
-    fn report(&self, _stage: &str, _current: usize, _total: usize) {}
-}
+impl ProgressSink for NullProgress {}
 
 /// Result of the design_crispr_library pipeline.
 ///
@@ -130,7 +126,6 @@ pub fn design_crispr_library(
     progress.set_step("indexing");
     progress.set_stage("Preparing genome data");
     progress.clear_items();
-    progress.report("indexing", 0, 7);
     if progress.is_cancelled() {
         return Err("cancelled".into());
     }
@@ -141,12 +136,9 @@ pub fn design_crispr_library(
     progress.set_step("scanning");
     progress.set_stage("Tiling genome features");
     progress.clear_items();
-    progress.report("tiling", 1, 7);
-
     let feature_tiles = annotate_features(&genes, feature_config, &chrom_sizes);
 
     progress.set_stage("Scanning PAM sites");
-    progress.report("scanning", 2, 7);
     if progress.is_cancelled() {
         return Err("cancelled".into());
     }
@@ -172,7 +164,6 @@ pub fn design_crispr_library(
     eprintln!("[mem] after PAM scan: RSS={:.0}MB peak={:.0}MB", rss_mb(), peak_mb());
 
     progress.set_stage("Enriching guide hits");
-    progress.report("enriching", 3, 7);
     if progress.is_cancelled() {
         return Err("cancelled".into());
     }
@@ -188,7 +179,6 @@ pub fn design_crispr_library(
     progress.set_step("scoring");
     progress.set_stage("Scoring off-targets");
     progress.clear_items();
-    progress.report("scoring", 4, 7);
     if progress.is_cancelled() {
         return Err("cancelled".into());
     }
@@ -292,7 +282,6 @@ pub fn design_crispr_library(
     progress.set_step("annotation");
     progress.set_stage("Annotating & streaming to sink");
     progress.clear_items();
-    progress.report("sweep", 6, 7);
     if progress.is_cancelled() {
         return Err("cancelled".into());
     }
@@ -357,7 +346,6 @@ pub fn design_crispr_library(
 
     progress.set_items(guides_written, guides_written);
     progress.set_stage(&format!("Streamed {} annotated guides", guides_written));
-    progress.report("complete", 7, 7);
 
     Ok(LibraryResult {
         total_guides_scored,
@@ -511,7 +499,8 @@ mod tests {
     #[test]
     fn test_null_progress() {
         let p = NullProgress;
-        p.report("test", 0, 1);
+        p.set_step("test");
+        p.set_items(0, 1);
         assert!(!p.is_cancelled());
     }
 }
