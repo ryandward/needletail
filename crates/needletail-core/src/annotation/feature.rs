@@ -190,27 +190,23 @@ fn fill_gap(
     // Sort claims by priority (lower = higher priority)
     claims.sort_by_key(|c| c.0);
 
-    // Resolve overlaps: higher priority claims win
-    // Use a coverage array approach for simplicity
+    // Resolve overlaps: higher priority claims win.
+    // Store the *claim index* (not def_idx) so that two same-definition claims
+    // from different source genes are treated as distinct — the merge below will
+    // correctly emit separate tiles, each with its own landmark.
     let mut assigned: Vec<Option<usize>> = vec![None; gap_len as usize];
 
-    for (_, claim_start, claim_end, idx, _) in &claims {
+    for (ci, (_, claim_start, claim_end, _, _)) in claims.iter().enumerate() {
         let local_start = (*claim_start - gap_start) as usize;
         let local_end = (*claim_end - gap_start) as usize;
         for pos in local_start..local_end {
             if assigned[pos].is_none() {
-                assigned[pos] = Some(*idx);
+                assigned[pos] = Some(ci);
             }
         }
     }
 
-    // Build claim lookup for gene association
-    let claim_genes: HashMap<(usize, i64, i64), &Region> = claims
-        .iter()
-        .map(|(_, s, e, idx, gene)| ((*idx, *s, *e), *gene))
-        .collect();
-
-    // Merge adjacent positions with same assignment into regions
+    // Merge adjacent positions with the same claim index into contiguous tiles.
     let mut regions = Vec::new();
     let mut run_start = 0usize;
     let mut run_assign = assigned[0];
@@ -224,7 +220,6 @@ fn fill_gap(
                 run_assign,
                 &config.features,
                 &claims,
-                &claim_genes,
                 &mut regions,
             );
             run_start = i;
@@ -239,7 +234,6 @@ fn fill_gap(
         run_assign,
         &config.features,
         &claims,
-        &claim_genes,
         &mut regions,
     );
 
@@ -247,6 +241,9 @@ fn fill_gap(
 }
 
 /// Emit a region for a contiguous run in the gap.
+///
+/// `assignment` is a claim index into `claims`. Because we track claim index
+/// (not def_idx), the source gene is unambiguous — no fallback needed.
 fn emit_gap_region(
     chrom: &str,
     start: i64,
@@ -254,42 +251,20 @@ fn emit_gap_region(
     assignment: Option<usize>,
     features: &[FeatureDefinition],
     claims: &[(i32, i64, i64, usize, &Region)],
-    claim_genes: &HashMap<(usize, i64, i64), &Region>,
     out: &mut Vec<Region>,
 ) {
-    match assignment {
-        None => {
-            // Gap position has no regulatory assignment — emit nothing.
-        }
-        Some(def_idx) => {
-            let def = &features[def_idx];
+    let Some(ci) = assignment else { return };
 
-            // Find the gene associated with this claim
-            let source_gene = claims
-                .iter()
-                .find(|(_, cs, ce, idx, _)| {
-                    *idx == def_idx && *cs <= start && *ce >= end
-                })
-                .or_else(|| {
-                    // Fallback: any claim with this def_idx
-                    claims.iter().find(|(_, _, _, idx, _)| *idx == def_idx)
-                })
-                .map(|(_, cs, ce, idx, gene)| {
-                    claim_genes.get(&(*idx, *cs, *ce)).copied().unwrap_or(gene)
-                });
+    let (_, _, _, def_idx, gene) = &claims[ci];
+    let def = &features[*def_idx];
 
-            let mut region = Region::new(chrom, start, end)
-                .with_name(&def.name)
-                .with_tag("feature_type", def.name.clone());
+    let mut region = Region::new(chrom, start, end)
+        .with_name(&def.name)
+        .with_tag("feature_type", def.name.clone())
+        .with_strand(gene.strand);
 
-            if let Some(gene) = source_gene {
-                region = region.with_strand(gene.strand);
-                try_enrich(&mut region, gene, def);
-            }
-
-            out.push(region);
-        }
-    }
+    try_enrich(&mut region, gene, def);
+    out.push(region);
 }
 
 /// Attempt to enrich a region with landmark coordinates from its source gene.
@@ -381,6 +356,57 @@ mod tests {
 
         let tiles = annotate_features(&[], &config, &sizes);
         assert_eq!(tiles.len(), 0);
+    }
+
+    /// Two promoter claims (one per gene) fill the same gap from opposite ends.
+    /// Before the fix, both wrote the same def_idx so the merge produced one
+    /// 1000bp tile; the wrong gene's landmark was attached; signed_distance
+    /// could reach -(max_distance * 2 - 1).  After the fix, two separate 500bp
+    /// tiles are emitted, each with its own gene's landmark.
+    #[test]
+    fn test_adjacent_promoter_claims_different_genes() {
+        // Reverse-strand gene ending at 1000, forward-strand gene starting at 2000.
+        // Gap [1000, 2000] = 1000bp.  Promoter max_distance = 500.
+        // Reverse-strand gene's promoter claims [1000, 1500] (upstream = right of gene.end).
+        // Forward-strand gene's promoter claims [1500, 2000] (upstream = left of gene.start).
+        let genes = vec![
+            Region::new("chr1", 0, 1000)
+                .with_strand(Strand::Reverse)
+                .with_name("rev_gene"),
+            Region::new("chr1", 2000, 3000)
+                .with_strand(Strand::Forward)
+                .with_name("fwd_gene"),
+        ];
+        let config = make_config();
+        let mut sizes = HashMap::new();
+        sizes.insert("chr1", 4000usize);
+
+        let tiles = annotate_features(&genes, &config, &sizes);
+
+        let promoters: Vec<_> = tiles.iter().filter(|r| {
+            r.tags.get("feature_type").and_then(|v| v.as_str()) == Some("promoter")
+        }).collect();
+
+        let promoter_def = config.features.iter().find(|f| f.name == "promoter").unwrap();
+        let max_dist = promoter_def.max_distance;
+
+        // Must be two separate promoter tiles, not one merged 1000bp tile
+        assert_eq!(promoters.len(), 2, "expected 2 promoter tiles, got {}: {:?}",
+            promoters.len(), promoters.iter().map(|p| (p.start, p.end, p.strand)).collect::<Vec<_>>());
+
+        for p in &promoters {
+            let width = p.end - p.start;
+            assert!(width <= max_dist, "promoter tile wider than max_distance: [{}, {}] = {}bp", p.start, p.end, width);
+
+            let landmark = p.tags["landmark"].as_i64().unwrap();
+            let fwd = p.strand.is_forward();
+            for pos in p.start..p.end {
+                let sd = crate::geometry::signed_distance(pos, landmark, fwd);
+                assert!(sd <= 0 && sd >= -max_dist,
+                    "signed_distance {sd} out of range for promoter tile [{}, {}], landmark={landmark}, fwd={fwd}",
+                    p.start, p.end);
+            }
+        }
     }
 
     #[test]
